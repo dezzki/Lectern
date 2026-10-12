@@ -1,0 +1,27 @@
+services:
+  research-reader-api:
+    build: ./server
+    image: gigaton-research-reader-api:latest
+    container_name: research-reader-api
+    restart: unless-stopped
+    init: true
+    environment:
+      PAPERS_ROOT: /papers
+      DB_PATH: /data/reader.db
+      READER_API_TOKEN: ${READER_API_TOKEN:?Set READER_API_TOKEN in .env}
+    ports:
+      # Bind only to the Tailscale interface by default. If Tailscale is not up
+      # yet, use:  SERVER_BIND_IP=127.0.0.1 docker compose up -d
+      # Never set SERVER_BIND_IP=0.0.0.0 without a firewall rule in place.
+      - "${SERVER_BIND_IP:-100.82.221.72}:8088:8080"
+    volumes:
+      # Read-only mount of the research papers. The API never writes here.
+      - /storage/magnamite/learningPapers:/papers:ro
+      # Persistent app database (annotations + progress).
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

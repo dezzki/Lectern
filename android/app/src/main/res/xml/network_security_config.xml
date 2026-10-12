@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The GIGATON API and all PDF content are served over HTTP on the Tailscale
+  network only. Android blocks cleartext by default from API 28+, so this app
+  opts in to cleartext. The server is never exposed to the public internet:
+  the Docker port is bound to the Tailscale interface 100.82.221.72 and the
+  papers mount is read-only. If this ever runs outside a trusted tailnet,
+  terminate TLS in front of the API and remove this opt-in.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

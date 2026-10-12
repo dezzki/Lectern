@@ -1,0 +1,44 @@
+# --------------------------------------------------------------------------- #
+# GIGATON Research Reader — .gitignore
+# Keep secrets, databases, binaries and machine config out of version control.
+# --------------------------------------------------------------------------- #
+
+# --- Secrets & local machine config (never commit) ----------------------------
+.env
+.env.*
+!.env.example
+local.properties
+
+# --- Build outputs ------------------------------------------------------------
+build/
+app/build/
+.gradle/
+.kotlin/
+captures/
+*.apk
+*.aab
+*.keystore
+*.jks
+
+# --- IDE / OS noise -----------------------------------------------------------
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# --- Python -------------------------------------------------------------------
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# --- Runtime data (annotations/progress DB if a local ./data ever appears) ---
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# --- Logs & crash artifacts ---------------------------------------------------
+*.log
+crash.log
