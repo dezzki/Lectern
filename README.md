@@ -1,250 +1,209 @@
-# GIGATON Research Reader
+# Lectern
 
-A native Android research-PDF reader for PDFs stored on the GIGATON home server
-(user: `100.82.221.72` on the Tailscale network). It navigates the **real folder
-tree** under `/storage/magnamite/learningPapers`, streams PDFs from the server,
-and keeps annotations/progress in a separate database — the original PDFs are
-never modified.
+A reader for research papers stored on my home server.
 
-Reading flow: folder-first browse → tap a PDF → lazy rendered reader with pinch
-zoom → highlight (drag a box), pen (ink strokes), typed notes, bookmarks,
-per-paper annotation outline, reading-progress resume, and optional per-paper
-offline downloads.
+Lectern is two pieces that work together:
 
-> **Read [`AGENT_SPEC.md`](AGENT_SPEC.md) first.** It is the source of truth for
-> the product, security and acceptance criteria.
+- `server/` is a FastAPI service that runs on the server (GIGATON). It lists the paper
+  folders, renders PDF pages to PNG, and stores annotations and reading progress in a
+  SQLite database.
+- `android/` is a Kotlin app built with Jetpack Compose. It browses the folder tree and
+  displays the pages the server renders.
+
+The service only reads the paper files. It never writes to them, and there are no upload,
+rename, or delete endpoints for source documents.
+
+## Why the server renders the pages
+
+Android's built-in `PdfRenderer` does not work on every device. On the phone I tested with,
+it opened a file, reported the page count, and then drew blank pages or threw while
+rendering a page. Bundling a PDF library in the app ran into other failures on the same
+device.
+
+Rendering on the server with PDFium (through `pypdfium2`) avoids all of that. The phone
+receives finished PNGs, so it does not need a PDF engine at all. The app is smaller
+(about 19 MB instead of 64 MB), and pages look the same on every device.
+
+## What the app does
+
+- Browses folders and PDFs under the configured library root, using the real directory
+  structure. There is no catalogue, no import step, and no grouping based on file names.
+- Reads server-rendered pages with vertical scrolling, pinch and button zoom, a page
+  indicator, and jump-to-page.
+- Resumes at the last page you read. Progress is saved on the server, so it carries over
+  between devices.
+- Annotates papers with highlights (drag a box over a region), pen strokes, typed notes,
+  and bookmarks. Annotations are stored separately from the PDF and are never written into
+  the file.
+- Downloads a single paper for offline reading by caching all of its page images. The
+  source PDF on the server is untouched.
+- Stores the API URL and token in Android's encrypted preferences. The token is not shown
+  or logged after you enter it.
 
 ## Repository layout
 
-```text
-gigaton-reader/
-├── AGENT_SPEC.md             # Full product and engineering specification
-├── README.md                 # This file
-├── .env.example              # Environment template; no real secret
-├── docker-compose.yml        # Server deployment (FastAPI + SQLite)
+```
+Lectern/
+├── AGENT_SPEC.md            Product and engineering notes
+├── README.md                This file
+├── .env.example             Environment template, no real secret
+├── docker-compose.yml       Server deployment
 ├── server/
-│   ├── main.py               # FastAPI API (annotations/progress/browse/file)
+│   ├── main.py              FastAPI app
 │   ├── Dockerfile
 │   ├── requirements.txt
-│   ├── requirements-dev.txt  # pytest + httpx
-│   └── tests/test_api.py     # 32 backend tests
-└── android/                  # Kotlin/Compose Android app (single module :app)
+│   ├── requirements-dev.txt
+│   └── tests/test_api.py    Backend tests
+└── android/                 Android app (single module, :app)
 ```
 
-## Server deployment on GIGATON
+## Server
 
-Requirements: Docker Engine + Compose, Tailscale running, the papers directory
-exists at `/storage/magnamite/learningPapers`.
+Requirements: Docker Engine, Docker Compose, Tailscale on the host, and the papers
+directory on disk. The intended install directory is `/opt/gigaton/compose/research-reader`.
 
-The intended project directory is `/opt/gigaton/compose/research-reader`.
+### Deploy
 
 ```bash
-# 1. Create the deployment directory and data volume
 sudo mkdir -p /opt/gigaton/compose/research-reader/data
 sudo test -d /storage/magnamite/learningPapers
 
-# 2. Copy the project (docker-compose.yml, server/, .env.example) into it
+# copy docker-compose.yml, server/, and .env.example into that directory, then:
 cd /opt/gigaton/compose/research-reader
-
-# 3. Generate a real token (never commit this) and a 600-permission .env
 printf 'READER_API_TOKEN=%s\n' "$(openssl rand -hex 32)" > .env
 chmod 600 .env
 
-# 4. Make the SQLite volume writable by the container user (uid 10001, gid 1001)
+# the container runs as uid 10001, gid 1001; give it the data volume
 sudo chown -R 10001:1001 data
 
-# 5. Build and start
 docker compose up -d --build
-docker compose logs -f        # Ctrl-C to detach
+docker compose logs -f
 ```
 
-The compose file binds host port `8088` **to the Tailscale interface only**
-(`100.82.221.72:8088:8080` by default). The container mounts
-`/storage/magnamite/learningPapers:/papers:ro` (read-only) and persists its
-SQLite database under `./data`.
+`docker-compose.yml` binds port 8088 to the Tailscale address `100.82.221.72` by default.
+Change `SERVER_BIND_IP` if that address moves. Do not bind `0.0.0.0` unless a firewall rule
+already limits access to the tailnet.
 
-### Two container identity notes (important)
+The container mounts `/storage/magnamite/learningPapers:/papers:ro` and keeps its database
+under `./data`.
 
-- The unprivileged container user is built with **gid 1001**, matching the host
-  `gigatonshare` group, so papers like
-  `Harness_papers/01_ReAct_2210.03629.pdf` (owner `gigatonshare`, mode
-  `rw-rw----`) are readable. The library stays read-only; no `chmod 777` is
-  needed.
-- The `data/` directory must be owned by the container user
-  (`sudo chown -R 10001:1001 data`) or the database cannot be created.
+### Container user
 
-### If Tailscale's interface is not up yet
+The image runs as uid 10001 with gid 1001, which matches the host group that owns the
+paper files. That is enough to read the library without changing file permissions on the
+host. The `data` directory has to be writable by that user, which is why the `chown` step
+above is there.
 
-```bash
-SERVER_BIND_IP=127.0.0.1 docker compose up -d
-```
+### API
 
-Never set `SERVER_BIND_IP=0.0.0.0` without a firewall rule that restricts
-access to the tailnet — this service is personal and must not be exposed on the
-public internet.
+| Method | Route | Purpose |
+|---|---|---|
+| GET | `/api/health` | Health check. No token required. |
+| GET | `/api/browse?path=&limit=&offset=` | List folders and PDFs under the root |
+| GET | `/api/meta?path=` | Page count and page sizes for a PDF |
+| GET | `/api/page?path=&page=&max_width=` | PNG of one rendered page |
+| GET | `/api/file?path=` | Stream the original PDF |
+| GET | `/api/annotations?paper_path=` | List annotations for a paper |
+| PUT | `/api/annotations` | Create or update an annotation |
+| DELETE | `/api/annotations/{id}` | Delete an annotation |
+| GET | `/api/progress?paper_path=` | Read reading progress |
+| PUT | `/api/progress` | Save reading progress |
 
-### Verify
+Every route except `/api/health` needs `Authorization: Bearer <READER_API_TOKEN>`.
 
-```bash
-curl http://100.82.221.72:8088/api/health                            # no token needed
-curl -H "Authorization: Bearer $READER_API_TOKEN" \
-     "http://100.82.221.72:8088/api/browse?path=Harness_papers"
-```
+Paths are resolved inside the papers root. Absolute paths, `..`, NUL bytes, and symlinks
+that point outside the root are rejected. Annotation payloads are JSON and capped at 1 MB.
+Rendered pages are cached under `data/pagecache` and keyed by file, page, width, and the
+source file's timestamp, so editing a PDF invalidates its cache.
 
-## API routes
+## Android app
 
-| Method | Route | Purpose | Auth |
-|---|---|---|---|
-| GET | `/api/health` | Health + root-exists probe | none |
-| GET | `/api/browse?path=&limit=&offset=` | List folders first, then PDFs, under the root | bearer |
-| GET | `/api/file?path=` | Stream a PDF (never mutated) | bearer |
-| GET | `/api/annotations?paper_path=` | List annotations for a paper | bearer |
-| PUT | `/api/annotations` | Create/update annotation (last-write-wins) | bearer |
-| DELETE | `/api/annotations/{id}` | Delete annotation | bearer |
-| GET | `/api/progress?paper_path=` | Read reading progress | bearer |
-| PUT | `/api/progress` | Save reading progress | bearer |
-
-Path handling: every path is resolved inside `/papers`; absolute paths, `..`
-traversal, NUL bytes and symlink escapes are rejected. Annotation payloads are
-validated JSON with a 1 MB limit; oversized request bodies are rejected
-(413). All user data lives in `/data/reader.db` — there are **no** write routes
-for source PDFs.
-
-## Android build & install
-
-### Reproducible build (Linux / macOS / Windows with Android Studio)
-
-Requirements: JDK 17, Android SDK Platform 35, Gradle 8.9 (any Gradle ≥ 8.9).
+Build requirements: JDK 17 and Android SDK 35.
 
 ```bash
 cd android
-./gradlew :app:assembleDebug            # produces app/build/outputs/apk/debug/app-debug.apk
-./gradlew :app:testDebugUnitTest        # JVM unit tests (API client, payloads, file naming)
+./gradlew :app:assembleDebug        # app/build/outputs/apk/debug/app-debug.apk
+./gradlew :app:testDebugUnitTest    # unit tests
 ```
 
-Or open the `android/` folder in Android Studio and run the `app` configuration.
+Install on a phone that is on the tailnet:
 
-### Install on a phone
+```bash
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
 
-1. Put the phone on the same Tailscale tailnet as GIGATON.
-2. `adb install app-debug.apk` (or copy the APK to the phone and open it).
-3. First launch → **Connect** screen:
-   - API base URL: `http://100.82.221.72:8088`
-   - API token: the `READER_API_TOKEN` from the server `.env`
-   - Tap **Save & Connect**. The app validates health then an authenticated
-     browse of the root folder.
+On first launch, open the Connect screen and enter:
 
-The token is stored in Keystore-backed encrypted preferences and is never
-logged or shown again in the UI.
+- API base URL: `http://100.82.221.72:8088`
+- API token: the `READER_API_TOKEN` from the server's `.env`
 
-### Reader features in the app
+The app checks `/api/health` and then lists the root folder to confirm the token works.
 
-- **Browse**: folders first, then PDFs, alphabetical and case-insensitive; tap
-  a folder to enter it, back-arrow / breadcrumbs to leave, refresh, and a sync
-  status line (`N change(s) pending sync`).
-- **Reader**: pages are rendered **on demand** only for visible pages, with a
-  shared thread-safe renderer; vertical scrolling, pinch zoom and `+`/`−`
-  zoom, fit-width default, page indicator, jump-to-page, and resume at your
-  last page (synced across devices).
-- **Annotations**: bottom toolbar → Off / Highlight / Pen / Note.
-  - Highlight: drag a box over the region; stored as normalized coordinates
-    and redrawn at any zoom.
-  - Pen: finger/stylus ink strokes, saved per stroke; **Undo** removes the last
-    stroke.
-  - Note: tap to attach a typed note to a page position.
-  - Bookmark: top-bar icon bookmarks the current page.
-  - **Annotations list** (top bar ¶ button): grouped outline with
-    page/summary, edit (notes/highlights), delete, and **jump to page**.
-- **Offline**: each PDF has a download button; download progress bar; once
-  downloaded the reader uses the local copy and it opens offline. Tapping the
-  download icon again removes the local copy — the server original is never
-  touched. Non-downloaded papers are streamed into a short-lived app cache.
+## Offline reading
 
-Notes: Android's `PdfRenderer` doesn't expose an embedded-text layer, so
-"text highlight" is a rectangle/region selection gesture (normalized quads),
-not an OS text-extraction select. This is a documented platform limitation, not
-a missing feature.
+Tapping the download icon next to a PDF caches every page image for that paper. After
+that, the paper opens without a network. Tapping the icon again removes the cached pages.
+Nothing on the server changes.
 
-Rendering engine: since some devices ship a broken platform `PdfRenderer`
-(blank/white or "could not be rendered" pages), the reader renders pages with
-the **bundled PDFium engine** (`com.github.barteksc:pdfium-android:1.9.0`,
-Apache-2.0) and only falls back to the platform renderer if PDFium cannot open
-a file. The app is bigger because of the bundled native libraries (~64 MB);
-that is the trade-off for consistent rendering across devices.
+Annotations and progress you make while offline are queued in a local database and pushed
+to the server on the next successful request. The browse screen shows how many changes are
+waiting and the last sync error, if any.
 
-## Sync & offline behaviour
+## Backups
 
-- Edits (annotations, deletes, progress) are written to the local Room database
-  **first**, then queued in an outbox and pushed to the server.
-- If the server is unreachable, the change stays queued and the browse screen
-  shows the pending count and the last sync error. Nothing is silently
-  dropped; sync is retried on every subsequent API call and app state reflects
-  it.
-- Server-side annotations use last-write-wins on `updated_at`; the client does
-  not overwrite unsynced local edits during refresh.
+- `data/reader.db` holds annotations and reading progress. Back it up.
+- The PDFs stay in the library folder and are backed up with the rest of that drive.
 
-## Backup
+## Updating
 
-- Back up `/opt/gigaton/compose/research-reader/data/reader.db` — it contains
-  all annotations and reading progress.
-- The PDFs are unchanged on the existing Magnamite storage and should be backed
-  up by your normal plan (e.g. the same archive you use for
-  `/storage/magnamite`).
-
-## Updates
+Copy the new files into the install directory and rebuild:
 
 ```bash
 cd /opt/gigaton/compose/research-reader
-# copy the new server/ files in, then:
-docker compose up -d --build
-# schema changes, if any, are handled by server/main.py initialization; the DB
-# file persists under ./data
+docker compose up -d --build --force-recreate
 ```
 
 ## Troubleshooting
 
-- **Can't connect from the app** — Tailscale connected on both ends? Is
-  `100.82.221.72` the server's current Tailscale IP (`tailscale ip` on the
-  server)? Is port 8088 free (`ss -ltn`)? Is the container healthy
-  (`docker compose ps`)?
-- **401 / "Incorrect token"** — the app token must equal `READER_API_TOKEN` in
-  the server `.env`; restart the container after changing it
-  (`docker compose up -d --force-recreate`).
-- **Blank library / "This folder is empty"** — the container mounted the
-  papers root read-only (`docker inspect research-reader-api` → mounts), the
-  `data/` volume is writable, and `/storage/magnamite/learningPapers` contains
-  the PDFs.
-- **Container can't read PDFs (permission denied in logs)** — the image's
-  `appuser` must be in gid 1001 (the default image already is). Rebuild if you
-  changed the Dockerfile: `docker compose build --no-cache server`.
-- **Database not created (`unable to open database file`)** — fix the `data/`
-  ownership: `sudo chown -R 10001:1001 data`.
-- **App keeps stopping when opening a paper (v1.0.0 / v1.0.1)** — that was a
-  navigation bug, not the server: paper paths were passed through
-  `Uri.encode()`, which leaves `/` and `&` raw, so AndroidX Navigation threw on
-  every PDF tap. **v1.0.2** encodes the route argument as URL-safe Base64 and
-  is the version to run. The Connect screen also now shows a **Copy crash log**
-  button — if anything still crashes, copy it and paste it to the developer;
-  the stack trace is written to the app's `crash.log`.
-- **Changed address** — update `SERVER_BIND_IP` in compose and the API base URL
-  in the app's Connect screen; `docker compose up -d` to re-bind.
-- **Offline edits queued but not syncing** — the browse screen shows the
-  pending count; connect to the tailnet and make any browse/refresh action to
-  retry.
+- **The app cannot connect.** Check that Tailscale is up on both devices, that the
+  container is running (`docker compose ps`), and that the server address in the app
+  matches the host's current Tailscale IP.
+- **401 from the API.** The token in the app has to match `READER_API_TOKEN`. Restart the
+  container after changing the `.env` file.
+- **A folder looks empty.** Confirm the container mounted the papers directory and that
+  the container user can read it.
+- **Pages do not load.** Test the endpoints directly:
+  `curl -H "Authorization: Bearer $TOKEN" "http://100.82.221.72:8088/api/meta?path=Harness_papers/01_ReAct_2210.03629.pdf"`.
+- **`unable to open database file` in the logs.** The `data` directory is not writable by
+  the container user. Run `sudo chown -R 10001:1001 data`.
 
-## Tests run (in this repository's CI environment)
+## Tests
 
-- Backend: `python -m pytest server/tests -q` → **32 passed**
-  (health, auth/401/503, browse sorting+pagination, PDF streaming,
-  traversal/symlink/absolute-path rejection, annotation CRUD + LWW + size
-  limits, progress CRUD, no source-mutation routes).
-- Android: `gradle :app:compileDebugKotlin`, `:app:testDebugUnitTest`
-  (API-client parsing/auth/error mapping, payload serialization, safe file
-  naming), `:app:assembleDebug` → debug APK.
-- Deployed end-to-end on GIGATON at `100.82.221.72:8088`: health, browse of the
-  real `Harness_papers/` tree (10 PDFs), byte-identical PDF streaming, and
-  annotation/progress persistence were verified with `curl`.
+Backend, from `server/`:
 
-Interactive on-device behaviour (pinch zoom feel, drawing latency) was not
-exercised on a physical Android device in this environment — that is the
-remaining manual acceptance step.
+```bash
+python -m pytest tests -q
+```
+
+Covers health, authentication, folder browsing and pagination, PDF streaming, page
+metadata and page rendering, path traversal and symlink rejection, annotation
+create/update/delete with payload limits, and reading progress.
+
+Android, from `android/`:
+
+```bash
+./gradlew :app:testDebugUnitTest
+```
+
+Covers the API client (response parsing, auth header, error mapping), the page image URL,
+annotation payload serialization, the route argument encoding, and the download file
+naming.
+
+## Credits
+
+- PDFium through [pypdfium2](https://github.com/pypdfium2-team/pypdfium2) (Apache-2.0 /
+  BSD-3-Clause) for page rendering.
+- [Coil](https://coil-kt.github.io/coil/) (Apache-2.0) for image loading.
+- FastAPI and Uvicorn.
+
+Personal project. No public hosting, no accounts, no telemetry.
