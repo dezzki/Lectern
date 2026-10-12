@@ -32,11 +32,11 @@ import androidx.compose.material.icons.filled.Undo
 import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material.icons.filled.ZoomOut
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconToggleButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -45,7 +45,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -58,31 +57,25 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.graphics.toArgb
 import com.gigaton.reader.AppContainer
 import com.gigaton.reader.GigatonReaderApp
+import com.gigaton.reader.data.network.PageMetaDto
 import com.gigaton.reader.data.repository.Payloads
 import com.gigaton.reader.data.repository.Repository
+import com.gigaton.reader.domain.ApiErrorKind
 import com.gigaton.reader.ui.pdf.AnnotatedPage
 import com.gigaton.reader.ui.pdf.InkStrokeNorm
-import com.gigaton.reader.ui.pdf.MAX_RENDER_WIDTH_PX
 import com.gigaton.reader.ui.pdf.OffsetNorm
-import com.gigaton.reader.ui.pdf.PdfiumDocument
 import com.gigaton.reader.ui.pdf.QuadNorm
-import com.gigaton.reader.ui.pdf.ReaderDocument
 import com.gigaton.reader.ui.pdf.ToolMode
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -96,68 +89,34 @@ fun ReaderScreen(
     val repository = remember { Repository(container) }
     val scope = rememberCoroutineScope()
 
-    var doc by remember { mutableStateOf<ReaderDocument?>(null) }
+    var meta by remember { mutableStateOf<PageMetaDto?>(null) }
     var fileError by remember { mutableStateOf<String?>(null) }
-    var fetchProgress by remember { mutableFloatStateOf(0f) }
+    var loadingPages by remember { mutableStateOf(true) }
     var fetchRetry by remember { mutableIntStateOf(0) }
-    var expectedSize by remember { mutableStateOf<Long?>(null) }
-    var integrityNote by remember { mutableStateOf<String?>(null) }
-    var integrityRetried by remember { mutableStateOf(false) }
 
     LaunchedEffect(paperPath, fetchRetry) {
         fileError = null
-        fetchProgress = 0f
-        integrityNote = null
-        val file = runCatching {
-            repository.fileForReading(paperPath) { done, total ->
-                fetchProgress = if (total != null && total > 0) done.toFloat() / total else 0f
-                if (total != null) expectedSize = total
+        loadingPages = true
+        meta = null
+        try {
+            val m = repository.pageMeta(paperPath)
+            meta = m
+        } catch (e: Exception) {
+            val msg = when (e) {
+                is com.gigaton.reader.domain.ApiException -> when (e.kind) {
+                    ApiErrorKind.UNREACHABLE -> "Cannot reach GIGATON. Check Tailscale and try again."
+                    ApiErrorKind.UNAUTHORIZED -> "Invalid API token — fix it in Settings."
+                    else -> e.message ?: "Could not read this paper."
+                }
+                else -> e.message ?: "Could not read this paper."
             }
-        }.getOrNull()
-        if (file == null) {
-            fileError = "Could not download this paper. Check Tailscale and try again."
-            return@LaunchedEffect
-        }
-
-        // Byte-level integrity: OkHttp fails loudly on a truncated body when
-        // Content-Length is present; still, guard against silent truncation by
-        // re-downloading once if sizes disagree.
-        val bytes = file.length()
-        val sizeOk = expectedSize == null || expectedSize == bytes
-        integrityNote = if (sizeOk) {
-            "File: ${fmtSize(bytes)}"
-        } else {
-            "File: ${fmtSize(bytes)} of ${fmtSize(expectedSize ?: 0)} — redownloading…"
-        }
-        if (!sizeOk && !integrityRetried) {
-            integrityRetried = true
-            runCatching { container.fileStore.cacheFile(paperPath).delete() }
-            runCatching { container.fileStore.downloadFile(paperPath).delete() }
-            fetchRetry++
-            return@LaunchedEffect
-        }
-
-        // PDFium-only rendering: the platform PdfRenderer is a known dead end on
-        // this device; never silently fall back to it again. If PDFium cannot
-        // open the file, show the REAL reason instead of a generic message.
-        val attempted = withContext(Dispatchers.IO) {
-            runCatching { PdfiumDocument.open(container.appContext, file) }
-        }
-        val d = attempted.getOrNull()
-        if (d == null) {
-            val err = attempted.exceptionOrNull()
             runCatching {
                 (container.appContext as com.gigaton.reader.GigatonReaderApp)
-                    .logRuntimeError("pdfium open for $paperPath", err ?: IllegalStateException("unknown open failure"))
+                    .logRuntimeError("meta for $paperPath", e)
             }
-            fileError = "The PDF engine couldn't open this file. ${err?.let { "${it::class.simpleName}: ${it.message}" } ?: "Unknown open error."}"
-        } else {
-            doc = d
+            fileError = msg
         }
-    }
-
-    DisposableEffect(doc) {
-        onDispose { doc?.close() }
+        loadingPages = false
     }
 
     val annotations by repository.annotationsFlow(paperPath).collectAsState(initial = emptyList())
@@ -173,25 +132,25 @@ fun ReaderScreen(
     // The layout width grows with zoom, but the rendered bitmap is capped so
     // high zoom can never allocate huge bitmaps (OOM protection).
     val targetWidthPx = (screenWidthPx * zoom).toInt().coerceAtLeast(1)
-    val renderWidthPx = minOf(targetWidthPx, MAX_RENDER_WIDTH_PX)
     val hScroll = rememberScrollState()
 
     val listState = rememberLazyListState()
     var currentPage by remember { mutableIntStateOf(1) }
 
-    // resume + page tracking
-    LaunchedEffect(doc) {
-        val d = doc ?: return@LaunchedEffect
+    // resume + page tracking (image pages: use server meta for page count)
+    val pageCount = meta?.pageCount ?: 0
+    LaunchedEffect(meta) {
+        val count = meta?.pageCount ?: return@LaunchedEffect
         val p = repository.loadProgress(paperPath)
-        currentPage = p.page.coerceIn(1, d.pageCount)
+        currentPage = p.page.coerceIn(1, count)
         runCatching { listState.scrollToItem(currentPage - 1) }
     }
 
     var saveJob by remember { mutableStateOf<Job?>(null) }
-    LaunchedEffect(doc) {
-        val d = doc ?: return@LaunchedEffect
+    LaunchedEffect(meta) {
+        val count = meta?.pageCount ?: return@LaunchedEffect
         snapshotFlow { listState.firstVisibleItemIndex + 1 }.collect { idx ->
-            currentPage = idx.coerceIn(1, d.pageCount)
+            currentPage = idx.coerceIn(1, count)
             saveJob?.cancel()
             saveJob = scope.launch {
                 delay(700)
@@ -204,9 +163,9 @@ fun ReaderScreen(
     LaunchedEffect(Unit) {
         container.jumpRequests.collect { page ->
             if (page != null) {
-                val d = doc
-                if (d != null) {
-                    runCatching { listState.scrollToItem(page.coerceIn(1, d.pageCount) - 1) }
+                val count = pageCount
+                if (count > 0) {
+                    runCatching { listState.scrollToItem(page.coerceIn(1, count) - 1) }
                 }
                 container.consumeJump()
             }
@@ -261,20 +220,11 @@ fun ReaderScreen(
                 title = {
                     Column {
                         Text(paperName.ifBlank { "PDF" }, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        val d = doc
                         Text(
-                            "Page $currentPage of ${d?.pageCount ?: "…"}",
+                            "Page $currentPage of ${meta?.pageCount ?: "…"}",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        integrityNote?.let {
-                            Text(
-                                it,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (it.contains("—")) MaterialTheme.colorScheme.error
-                                else MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
                     }
                 },
                 navigationIcon = {
@@ -319,7 +269,6 @@ fun ReaderScreen(
         },
     ) { padding ->
         Box(Modifier.fillMaxSize().padding(padding)) {
-            val d = doc
             when {
                 fileError != null -> Column(
                     Modifier.fillMaxSize().padding(24.dp),
@@ -331,20 +280,17 @@ fun ReaderScreen(
                     Spacer(Modifier.height(16.dp))
                     OutlinedButton(onClick = { fetchRetry++ }) { Text("Retry") }
                 }
-                d == null -> Column(
+                meta == null -> Column(
                     Modifier.fillMaxSize(),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Spacer(Modifier.height(120.dp))
                     Text("Fetching paper…", style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(12.dp))
-                    LinearProgressIndicator(
-                        progress = { fetchProgress },
-                        modifier = Modifier.fillMaxWidth(0.7f),
-                    )
+                    CircularProgressIndicator()
                 }
                 else -> {
-                    val pageCount = d.pageCount
+                    val count = meta?.pageCount ?: 0
                     val renderWidthDp = with(density) { targetWidthPx.toDp() }
                     Box(
                         Modifier
@@ -370,12 +316,13 @@ fun ReaderScreen(
                                 .fillMaxHeight(),
                             contentPadding = PaddingValues(bottom = 32.dp, top = 6.dp),
                         ) {
-                            items(pageCount, key = { it }) { index ->
+                            items(count, key = { it }) { index ->
+                                val pageInfo = meta?.pages?.getOrNull(index)
+                                val ratio = pageInfo?.let { (it.widthPt / it.heightPt).toFloat() } ?: 1f
                                 AnnotatedPage(
-                                    doc = d,
+                                    model = repository.pageImageModel(paperPath, index + 1),
                                     pageIndex = index,
-                                    renderWidthPx = renderWidthPx,
-                                    backgroundArgb = Color.White.toArgb(),
+                                    ratio = ratio,
                                     annotations = annotations.filter { it.page == index + 1 },
                                     tool = tool,
                                     inkColor = Payloads.INK_COLOR,
@@ -383,10 +330,10 @@ fun ReaderScreen(
                                     onInkStroke = onInkStroke,
                                     onHighlight = onHighlight,
                                     onNoteTap = onNoteTap,
-                                    onRenderError = { page, t ->
+                                    onImageError = { page, t ->
                                         runCatching {
                                             (container.appContext as GigatonReaderApp)
-                                                .logRuntimeError("render page ${page + 1}", t)
+                                                .logRuntimeError("page image ${page + 1}", t)
                                         }
                                     },
                                 )
@@ -437,9 +384,9 @@ fun ReaderScreen(
             confirmButton = {
                 TextButton(onClick = {
                     val target = jumpText.toIntOrNull() ?: 1
-                    val d = doc
-                    if (d != null) {
-                        val clamped = target.coerceIn(1, d.pageCount)
+                    val count = pageCount
+                    if (count > 0) {
+                        val clamped = target.coerceIn(1, count)
                         scope.launch { runCatching { listState.scrollToItem(clamped - 1) } }
                     }
                     jumpDialog = false
@@ -448,12 +395,6 @@ fun ReaderScreen(
             dismissButton = { TextButton(onClick = { jumpDialog = false }) { Text("Cancel") } },
         )
     }
-}
-
-private fun fmtSize(bytes: Long): String = when {
-    bytes >= 1024L * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
-    bytes >= 1024 -> "%.0f KB".format(bytes / 1024.0)
-    else -> "$bytes B"
 }
 
 @Composable

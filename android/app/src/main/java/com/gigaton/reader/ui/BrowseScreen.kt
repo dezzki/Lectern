@@ -184,13 +184,11 @@ fun BrowseScreen(
                                     scope.launch {
                                         downloadingProgress[entry.path] = 0f
                                         runCatching {
-                                            repository.download(entry.path) { done, total ->
+                                            repository.downloadPaperForOffline(entry.path) { done, total ->
                                                 downloadingProgress[entry.path] =
-                                                    if (total != null && total > 0) (done.toFloat() / total)
-                                                    else 0f
+                                                    if (total > 0) done.toFloat() / total else 0f
                                             }
                                         }.onFailure {
-                                            // surface as transient error text on the row
                                             error = friendlyDownloadError(it)
                                         }
                                         downloadingProgress.remove(entry.path)

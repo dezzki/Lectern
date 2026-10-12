@@ -193,6 +193,50 @@ class ApiClient(
         request("PUT", "api/progress", body = body) { it }
     }
 
+    /** Builds a URL for a server-rendered page image. */
+    fun pageImageUrl(path: String, page: Int, widthPx: Int): String =
+        url("api/page", "path" to path, "page" to page.toString(), "max_width" to widthPx.toString())
+
+    suspend fun getPageMeta(path: String): PageMetaDto =
+        request("GET", "api/meta", listOf("path" to path)) { parseJson(it) }
+
+    /** Streams a page image into [out] (used when caching a paper for offline). */
+    suspend fun fetchPageImage(
+        path: String,
+        page: Int,
+        widthPx: Int,
+        out: File,
+    ) = withContext(Dispatchers.IO) {
+        fetchInto(url("api/page", "path" to path, "page" to page.toString(), "max_width" to widthPx.toString()), out)
+    }
+
+    private suspend fun fetchInto(urlStr: String, out: File) = withContext(Dispatchers.IO) {
+        val builder = Request.Builder().url(urlStr)
+        try {
+            client.newCall(builder.build()).execute().use { resp ->
+                if (resp.code !in 200..299) {
+                    val err = when (resp.code) {
+                        401, 503 -> ApiException(ApiErrorKind.UNAUTHORIZED, "Invalid or missing API token")
+                        404 -> ApiException(ApiErrorKind.NOT_FOUND, "Resource not found on server")
+                        else -> ApiException(ApiErrorKind.SERVER, "Request failed (HTTP ${resp.code})")
+                    }
+                    throw err
+                }
+                val body = resp.body ?: throw ApiException(ApiErrorKind.OTHER, "No response body")
+                out.parentFile?.mkdirs()
+                body.byteStream().use { input ->
+                    out.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+            }
+        } catch (e: ApiException) {
+            throw e
+        } catch (e: IOException) {
+            throw ApiException(ApiErrorKind.UNREACHABLE, "Download failed: ${e.message ?: "network error"}")
+        }
+    }
+
     /** Validates connectivity: unauth health + authenticated browse of root. */
     suspend fun connectTest(): Pair<HealthDto, List<BrowseEntry>> {
         val h = health()

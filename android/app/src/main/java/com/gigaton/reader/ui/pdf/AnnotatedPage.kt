@@ -1,7 +1,5 @@
 package com.gigaton.reader.ui.pdf
 
-import android.graphics.Bitmap
-import android.os.Build
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -13,30 +11,27 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import coil.compose.AsyncImage
 import com.gigaton.reader.data.repository.Payloads.highlightQuad
 import com.gigaton.reader.domain.AnnotationRec
 import com.gigaton.reader.domain.arr
 import com.gigaton.reader.domain.float
-import com.gigaton.reader.domain.obj
 import com.gigaton.reader.domain.str
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.floatOrNull
 import kotlinx.serialization.json.jsonArray
@@ -55,17 +50,13 @@ data class QuadNorm(val x0: Float, val y0: Float, val x1: Float, val y1: Float)
 /** A single ink stroke with normalized points. */
 data class InkStrokeNorm(val color: String, val widthPx: Float, val points: List<OffsetNorm>)
 
-private fun Offset.toNorm(size: androidx.compose.ui.unit.IntSize): OffsetNorm =
+private fun Offset.toNorm(size: IntSize): OffsetNorm =
     OffsetNorm(if (size.width > 0) x / size.width else 0f, if (size.height > 0) y / size.height else 0f)
 
-private fun Offset.toNorm(size: androidx.compose.ui.geometry.Size): OffsetNorm =
-    OffsetNorm(if (size.width > 0) x / size.width else 0f, if (size.height > 0) y / size.height else 0f)
+private fun OffsetNorm.toOffset(size: IntSize): Offset = Offset(x * size.width, y * size.height)
 
-private fun OffsetNorm.toOffset(size: androidx.compose.ui.unit.IntSize): Offset =
-    Offset(x * size.width, y * size.height)
-
-private fun OffsetNorm.toOffset(size: androidx.compose.ui.geometry.Size): Offset =
-    Offset(x * size.width, y * size.height)
+private fun androidx.compose.ui.geometry.Size.toIntSize(): IntSize =
+    androidx.compose.ui.unit.IntSize(width.toInt(), height.toInt())
 
 private fun parseHexColor(hex: String?, fallback: Color): Color {
     if (hex.isNullOrBlank()) return fallback
@@ -77,16 +68,16 @@ private fun parseHexColor(hex: String?, fallback: Color): Color {
 }
 
 /**
- * A single lazily-rendered PDF page with an annotation overlay and the active
- * annotation tool's gestures. Only the pages that are currently composed get
- * rendered (via [PdfDocument.render] on a background dispatcher).
+ * A single page of a paper. The page is a server-rendered PNG loaded over
+ * Coil (the app's OkHttp client injects auth). The annotation overlay draws
+ * with normalized coordinates so highlights/ink/notes stay aligned at any
+ * zoom. Page interaction gestures feed the active annotation tool.
  */
 @Composable
 fun AnnotatedPage(
-    doc: ReaderDocument,
+    model: Any,
     pageIndex: Int,
-    renderWidthPx: Int,
-    backgroundArgb: Int,
+    ratio: Float,
     annotations: List<AnnotationRec>,
     tool: ToolMode,
     inkColor: String,
@@ -94,31 +85,9 @@ fun AnnotatedPage(
     onInkStroke: (Int, InkStrokeNorm) -> Unit,
     onHighlight: (Int, QuadNorm) -> Unit,
     onNoteTap: (Int, OffsetNorm) -> Unit,
-    onRenderError: (Int, Throwable) -> Unit = { _, _ -> },
+    onImageError: (Int, Throwable) -> Unit = { _, _ -> },
 ) {
-    var bitmap by remember(pageIndex, renderWidthPx) { mutableStateOf<Bitmap?>(null) }
-    var renderFailed by remember(pageIndex, renderWidthPx) { mutableStateOf(false) }
-    var lastRenderError by remember(pageIndex, renderWidthPx) { mutableStateOf<Throwable?>(null) }
-    LaunchedEffect(pageIndex, renderWidthPx) {
-        renderFailed = false
-        lastRenderError = null
-        val result = runCatching {
-            withContext(Dispatchers.Default) {
-                doc.render(pageIndex, renderWidthPx, backgroundArgb)
-            }
-        }.getOrNull()
-        bitmap = result?.bitmap
-        val error = result?.error
-        if (bitmap == null && error != null) {
-            renderFailed = true
-            lastRenderError = error
-            onRenderError(pageIndex, error)
-        }
-    }
-
-    val engineLabel = if (doc is PdfiumDocument) "PDFium (bundled)" else "Android PdfRenderer"
-
-    val ratio = remember(pageIndex) { doc.ratio(pageIndex) }
+    var loadFailed by remember(pageIndex) { mutableStateOf(false) }
 
     var liveInk by remember(pageIndex) { mutableStateOf<List<OffsetNorm>>(emptyList()) }
     var dragStart by remember { mutableStateOf<Offset?>(null) }
@@ -152,7 +121,6 @@ fun AnnotatedPage(
                         x0 = minOf(s.x, e.x) / size.width, y0 = minOf(s.y, e.y) / size.height,
                         x1 = maxOf(s.x, e.x) / size.width, y1 = maxOf(s.y, e.y) / size.height,
                     )
-                    // ignore accidental micro-drags
                     if ((q.x1 - q.x0) * size.width > 16f || (q.y1 - q.y0) * size.height > 16f) {
                         onHighlight(pageIndex, q)
                     }
@@ -170,52 +138,36 @@ fun AnnotatedPage(
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .aspectRatio(ratio)
+            .aspectRatio(ratio.coerceAtLeast(0.05f))
             .then(interactionModifier)
     ) {
-        val bmp = bitmap
-        if (bmp != null) {
-            Image(
-                bitmap = bmp.asImageBitmap(),
+        if (loadFailed) {
+            Box(
+                Modifier.fillMaxSize().background(Color(0xFFF0F0F0))
+                    .padding(16.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    "This page couldn't be loaded. Check the connection and try again.",
+                    color = Color(0xFF777777),
+                    style = androidx.compose.material3.MaterialTheme.typography.labelSmall,
+                )
+            }
+        } else {
+            AsyncImage(
+                model = model,
                 contentDescription = "Page ${pageIndex + 1}",
                 contentScale = ContentScale.FillBounds,
                 modifier = Modifier.fillMaxSize(),
+                onError = {
+                    loadFailed = true
+                    onImageError(pageIndex, it.result.throwable)
+                },
             )
-        } else {
-            Box(Modifier.fillMaxSize().background(Color(backgroundArgb))) {
-                if (renderFailed) {
-                    androidx.compose.foundation.layout.Column(
-                        Modifier.fillMaxSize().padding(16.dp),
-                        horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally,
-                        verticalArrangement = androidx.compose.foundation.layout.Arrangement.Center,
-                    ) {
-                        Text(
-                            "This page couldn't be rendered",
-                            color = Color(0xFF777777),
-                            style = androidx.compose.material3.MaterialTheme.typography.labelMedium,
-                        )
-                        androidx.compose.foundation.layout.Spacer(
-                            Modifier.height(6.dp),
-                        )
-                        val err = lastRenderError
-                        Text(
-                            text = err?.let { "${it::class.simpleName ?: ""}: ${it.message ?: ""}" }
-                                ?: "unknown renderer error",
-                            color = Color(0xFFCC4444),
-                            style = androidx.compose.material3.MaterialTheme.typography.labelSmall,
-                        )
-                        androidx.compose.foundation.layout.Spacer(Modifier.height(6.dp))
-                        Text(
-                            "$engineLabel · Android ${Build.VERSION.RELEASE} · ${Build.MODEL}",
-                            color = Color(0xFF666666),
-                            style = androidx.compose.material3.MaterialTheme.typography.labelSmall,
-                        )
-                    }
-                }
-            }
         }
 
         Canvas(Modifier.fillMaxSize()) {
+            val pxSize = size.toIntSize()
             for (a in annotations) {
                 when (a.kind) {
                     "highlight" -> {
@@ -249,7 +201,7 @@ fun AnnotatedPage(
                                 val arr = p.jsonArray
                                 val x = arr[0].jsonPrimitive.floatOrNull ?: continue
                                 val y = arr[1].jsonPrimitive.floatOrNull ?: continue
-                                val offset = OffsetNorm(x, y).toOffset(size)
+                                val offset = OffsetNorm(x, y).toOffset(pxSize)
                                 if (first) { path.moveTo(offset.x, offset.y); first = false }
                                 else path.lineTo(offset.x, offset.y)
                             }
@@ -264,7 +216,7 @@ fun AnnotatedPage(
                         val x = a.payload.float("x")
                         val y = a.payload.float("y")
                         if (x != null && y != null) {
-                            val pos = OffsetNorm(x, y).toOffset(size)
+                            val pos = OffsetNorm(x, y).toOffset(pxSize)
                             drawCircle(
                                 color = if (a.kind == "bookmark") Color(0xFF00BCD4) else Color(0xFFFF9800),
                                 radius = 9f,
@@ -276,11 +228,10 @@ fun AnnotatedPage(
                 }
             }
 
-            // In-progress gestures
             if (tool == ToolMode.PEN && liveInk.isNotEmpty()) {
                 val path = Path()
                 liveInk.forEachIndexed { i, p ->
-                    val o = p.toOffset(size)
+                    val o = p.toOffset(pxSize)
                     if (i == 0) path.moveTo(o.x, o.y) else path.lineTo(o.x, o.y)
                 }
                 drawPath(path, parseHexColor(inkColor, Color(0xFFE91E63)), style = androidx.compose.ui.graphics.drawscope.Stroke(width = inkWidthPx))

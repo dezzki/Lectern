@@ -3,11 +3,14 @@ package com.gigaton.reader
 import android.app.Application
 import android.content.Context
 import androidx.room.Room
+import coil.ImageLoader
+import coil.Coil
 import com.gigaton.reader.data.local.AppDatabase
 import com.gigaton.reader.data.local.FileStore
 import com.gigaton.reader.data.local.SettingsStore
 import com.gigaton.reader.data.network.ApiClient
 import com.gigaton.reader.data.repository.Repository
+import okhttp3.OkHttpClient
 
 class GigatonReaderApp : Application() {
 
@@ -17,7 +20,17 @@ class GigatonReaderApp : Application() {
     override fun onCreate() {
         super.onCreate()
         container = AppContainer(this)
+        installCoilImageLoader()
         installCrashLogger()
+    }
+
+    /** Page images use the authenticated OkHttp client (bearer token). */
+    private fun installCoilImageLoader() {
+        val loader = ImageLoader.Builder(this)
+            .okHttpClient(container.okHttp)
+            .crossfade(true)
+            .build()
+        Coil.setImageLoader(loader)
     }
 
     /**
@@ -77,6 +90,21 @@ class AppContainer(context: Context) {
 
     @Volatile private var cachedBase: String = ""
     @Volatile private var cachedApi: ApiClient? = null
+
+    /** Shared OkHttp client with the auth header, used by Coil for page images. */
+    val okHttp: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+            .addInterceptor { chain ->
+                val token = settings.token
+                val builder = chain.request().newBuilder()
+                    .header("User-Agent", "GigatonReader/1.1")
+                if (token.isNotBlank()) builder.header("Authorization", "Bearer $token")
+                chain.proceed(builder.build())
+            }
+            .build()
+    }
 
     /** Returns an ApiClient for the current base URL, rebuilding if it changed. */
     fun api(): ApiClient {

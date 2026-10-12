@@ -82,3 +82,17 @@ data class SyncStateDto(
     val pending: Int = 0,
     val lastError: String? = null,
 )
+
+@Serializable
+data class PageMetaPageDto(
+    val page: Int,
+    @SerialName("width_pt") val widthPt: Double,
+    @SerialName("height_pt") val heightPt: Double,
+)
+
+@Serializable
+data class PageMetaDto(
+    val path: String,
+    @SerialName("page_count") val pageCount: Int = 0,
+    val pages: List<PageMetaPageDto> = emptyList(),
+)

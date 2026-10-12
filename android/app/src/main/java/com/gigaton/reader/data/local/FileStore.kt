@@ -5,10 +5,10 @@ import java.io.File
 import java.security.MessageDigest
 
 /**
- * Manages PDF binaries in app-private storage. Downloaded papers live in
- * `filesDir/downloads`; the reader may also create temporary cache copies.
- * File names are derived from a hash of the server path, so there is no
- * risk of traversal or name collision from weird paper names.
+ * Manages downloaded page images in app-private storage. With server-side
+ * rendering, "downloading a paper for offline" means caching every page image.
+ * File names are derived from a hash of the server path so no traversal or
+ * name collision is possible from weird paper names.
  */
 class FileStore(context: Context) {
 
@@ -21,23 +21,40 @@ class FileStore(context: Context) {
                 .digest(serverPath.toByteArray(Charsets.UTF_8))
                 .take(12)
                 .joinToString("") { "%02x".format(it) }
-            return "paper-$digest.pdf"
+            return "paper-$digest"
         }
     }
 
-    /** Permanent file for a downloaded paper (may not exist yet). */
-    fun downloadFile(serverPath: String): File = File(downloadsDir, safeFileName(serverPath))
+    /** Directory holding a paper's cached page images for [widthPx]. */
+    fun pagesDir(serverPath: String, widthPx: Int): File =
+        File(downloadsDir, "${safeFileName(serverPath)}_p$widthPx")
 
-    /** Temporary cache file used when opening a paper the user never downloaded. */
-    fun cacheFile(serverPath: String): File = File(cacheDir, safeFileName(serverPath))
+    /** Permanent page image used for offline reading. */
+    fun pageImageFile(serverPath: String, page: Int, widthPx: Int): File =
+        File(pagesDir(serverPath, widthPx), "p$page.png")
 
-    fun isDownloaded(serverPath: String): Boolean = downloadFile(serverPath).exists()
+    /** Short-lived cache copy (reader uses it when it exists). */
+    fun cachePagesDir(serverPath: String, widthPx: Int): File =
+        File(cacheDir, "${safeFileName(serverPath)}_p$widthPx")
 
-    fun deleteDownload(serverPath: String) {
-        downloadFile(serverPath).delete()
+    fun cachePageFile(serverPath: String, page: Int, widthPx: Int): File =
+        File(cachePagesDir(serverPath, widthPx), "p$page.png")
+
+    fun isPaperOffline(serverPath: String, widthPx: Int): Boolean {
+        val dir = pagesDir(serverPath, widthPx)
+        return dir.exists() && (dir.listFiles()?.isNotEmpty() == true)
+    }
+
+    fun deletePages(serverPath: String) {
+        downloadPagesDirectories(serverPath).forEach { dir -> dir.deleteRecursively() }
     }
 
     fun clearCache() {
-        cacheDir.listFiles()?.forEach { it.delete() }
+        cacheDir.listFiles()?.forEach { it.deleteRecursively() }
     }
+
+    private fun downloadPagesDirectories(serverPath: String): List<File> =
+        downloadsDir.listFiles { f ->
+            f.name.startsWith(safeFileName(serverPath) + "_p")
+        }?.toList() ?: emptyList()
 }

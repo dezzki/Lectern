@@ -173,16 +173,38 @@ class ApiClientTest {
     }
 
     @Test
+    fun pageMetaParses() = runBlocking {
+        server.enqueue(
+            MockResponse().setBody("""
+                {"path":"Harness_papers/a.pdf","page_count":3,"pages":[
+                  {"page":1,"width_pt":612.0,"height_pt":792.0},
+                  {"page":2,"width_pt":612.0,"height_pt":792.0},
+                  {"page":3,"width_pt":500.0,"height_pt":800.0}]}
+            """.trimIndent())
+        )
+        val meta = client!!.getPageMeta("Harness_papers/a.pdf")
+        assertEquals(3, meta.pageCount)
+        assertEquals(612.0, meta.pages[0].widthPt, 0.001)
+        assertEquals(800.0, meta.pages[2].heightPt, 0.001)
+    }
+
+    @Test
+    fun pageImageUrlIsBuildable() {
+        val c = ApiClient(baseUrl = "http://100.82.221.72:8088", token = { "t" })
+        val url = c.pageImageUrl("Harness_papers/a.pdf", 2, 1400)
+        assertTrue(url.contains("api/page"))
+        assertTrue(url.contains("max_width=1400"))
+        assertTrue(url.contains("page=2"))
+        assertTrue(url.contains("path=Harness_papers%2Fa.pdf"))
+    }
+
+    @Test
     fun routeTargetRoundTripPreservesOddPaths() {
-        // Regression: paper paths used to be passed through Uri.encode(), which
-        // leaves `/` and `&` raw and breaks Navigation argument matching. The
-        // URL-safe Base64 target must round-trip any realistic path.
         val path = "Harness_papers/01_ReAct_2210.03629.pdf"
         val name = "01_ReAct_2210.03629 (semi:colon & ampersand).pdf"
         val route = Routes.reader(path, name)
         assertTrue(route.startsWith("reader/"))
         val target = route.removePrefix("reader/")
-        // No reserved URL characters may leak into the argument.
         assertTrue(!target.contains('/'))
         assertTrue(!target.contains('&'))
         assertTrue(!target.contains('?'))

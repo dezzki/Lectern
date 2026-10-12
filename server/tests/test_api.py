@@ -10,6 +10,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 
+import pypdfium2 as pdfium
 import pytest
 
 TEST_TOKEN = "test-token-0123456789abcdef"
@@ -27,7 +28,10 @@ def api(tmp_path, monkeypatch):
     root = tmp_path / "papers"
     (root / "Sub Folder").mkdir(parents=True)
     (root / "Sub Folder" / "nested.pdf").write_bytes(b"%PDF-1.4 nested\n")
-    (root / "Alpha.pdf").write_bytes(b"%PDF-1.4 alpha\n")
+
+    # A real, renderable 2-page PDF for the /api/meta + /api/page tests.
+    (root / "Alpha.pdf").write_bytes(make_renderable_pdf(pages=2))
+
     (root / "beta.pdf").write_bytes(b"%PDF-1.4 beta\n")
     (root / "not_a_pdf.txt").write_text("ignore me")
     (root / "Empty_Dir").mkdir()
@@ -46,6 +50,20 @@ def api(tmp_path, monkeypatch):
         yield client
 
     importlib.reload(main)
+
+
+def make_renderable_pdf(pages: int = 2) -> bytes:
+    pdf = pdfium.PdfDocument.new()
+    try:
+        for _ in range(pages):
+            pdf.new_page(width=612, height=792)
+        import io as _io
+
+        buffer = _io.BytesIO()
+        pdf.save(buffer)
+        return buffer.getvalue()
+    finally:
+        pdf.close()
 
 
 def auth_headers():
@@ -204,10 +222,16 @@ def test_symlink_escape_rejected(api):
 # --------------------------------------------------------------------------- #
 
 def test_file_stream_returns_pdf_bytes(api):
-    r = api.get("/api/file", params={"path": "Alpha.pdf"}, headers=auth_headers())
+    # beta.pdf is a tiny hand-crafted fixture with exact known bytes.
+    r = api.get("/api/file", params={"path": "beta.pdf"}, headers=auth_headers())
     assert r.status_code == 200
     assert r.headers["content-type"] == "application/pdf"
-    assert r.content == b"%PDF-1.4 alpha\n"
+    assert r.content == b"%PDF-1.4 beta\n"
+
+    # Alpha.pdf is a real renderable PDF now.
+    r = api.get("/api/file", params={"path": "Alpha.pdf"}, headers=auth_headers())
+    assert r.status_code == 200
+    assert r.content.startswith(b"%PDF")
 
 
 def test_file_rejects_non_pdf(api):
@@ -379,6 +403,68 @@ def test_progress_requires_valid_paper(api):
     assert r.status_code == 400
     r = api.put("/api/progress", json={"paper_path": "Alpha.pdf", "page": 0}, headers=h)
     assert r.status_code == 422
+
+
+# --------------------------------------------------------------------------- #
+# Server-side page rendering (Option B)
+# --------------------------------------------------------------------------- #
+
+def test_page_meta(api):
+    r = api.get("/api/meta", params={"path": "Alpha.pdf"}, headers=auth_headers())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["path"] == "Alpha.pdf"
+    assert body["page_count"] == 2
+    assert len(body["pages"]) == 2
+    for p in body["pages"]:
+        assert p["width_pt"] > 0 and p["height_pt"] > 0
+    assert body["pages"][0]["page"] == 1
+
+
+def test_page_image_renders_png(api):
+    r = api.get("/api/page", params={"path": "Alpha.pdf", "page": 1, "max_width": 600},
+                headers=auth_headers())
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/png"
+    assert r.content[:8] == b"\x89PNG\r\n\x1a\n"  # PNG signature
+    assert len(r.content) > 500  # real rendered content, not an empty stub
+
+
+def test_page_image_cache_hit(api):
+    h = auth_headers()
+    a = api.get("/api/page", params={"path": "Alpha.pdf", "page": 2, "max_width": 300}, headers=h)
+    b = api.get("/api/page", params={"path": "Alpha.pdf", "page": 2, "max_width": 300}, headers=h)
+    assert a.status_code == 200 and b.status_code == 200
+    assert a.content == b.content
+
+
+def test_page_image_out_of_range(api):
+    h = auth_headers()
+    assert api.get("/api/page", params={"path": "Alpha.pdf", "page": 0}, headers=h).status_code == 422
+    assert api.get("/api/page", params={"path": "Alpha.pdf", "page": 99}, headers=h).status_code == 404
+
+
+def test_page_requires_valid_pdf(api):
+    h = auth_headers()
+    assert api.get("/api/page", params={"path": "not_a_pdf.txt", "page": 1}, headers=h).status_code == 404
+    assert api.get("/api/meta", params={"path": "not_a_pdf.txt"}, headers=h).status_code == 404
+
+
+def test_page_endpoints_require_auth(api):
+    assert api.get("/api/meta", params={"path": "Alpha.pdf"}).status_code == 401
+    assert api.get("/api/page", params={"path": "Alpha.pdf", "page": 1}).status_code == 401
+
+
+def test_page_meta_traversal_rejected(api):
+    assert api.get("/api/meta", params={"path": "../.."}, headers=auth_headers()).status_code == 400
+    assert api.get("/api/page", params={"path": "../../etc/passwd", "page": 1},
+                   headers=auth_headers()).status_code == 400
+
+
+def test_page_max_width_capped(api):
+    r = api.get("/api/page", params={"path": "Alpha.pdf", "page": 1, "max_width": 20000},
+                headers=auth_headers())
+    assert r.status_code == 422  # le=2000 bound enforced by validation
 
 
 # --------------------------------------------------------------------------- #

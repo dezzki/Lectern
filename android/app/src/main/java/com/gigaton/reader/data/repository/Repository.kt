@@ -67,45 +67,64 @@ class Repository(private val container: AppContainer) {
     suspend fun browse(path: String): List<BrowseEntry> = api.browse(path)
 
     // ------------------------------------------------------------------ //
-    // Downloads / offline
+    // Downloads / offline (page images, server-rendered)
     // ------------------------------------------------------------------ //
+
+    companion object {
+        /** Width (px) used for page images; kept equal for offline cache hits. */
+        const val CLIENT_PAGE_WIDTH = 1400
+    }
 
     fun downloads(): Flow<List<DownloadEntity>> = db.downloadDao().all()
 
-    fun isDownloaded(path: String): Boolean = container.fileStore.isDownloaded(path)
+    fun isDownloaded(path: String): Boolean =
+        container.fileStore.isPaperOffline(path, CLIENT_PAGE_WIDTH)
+
+    suspend fun pageMeta(path: String) = api.getPageMeta(path)
+
+    fun pageImageUrl(path: String, page: Int): String =
+        api.pageImageUrl(path, page, CLIENT_PAGE_WIDTH)
 
     /**
-     * Downloads a paper permanently (explicit user action) with progress.
+     * Coil model for a page: the cached local file if the paper was downloaded
+     * for offline, otherwise the server URL. Offline reading therefore works
+     * with zero extra path logic.
      */
-    suspend fun download(path: String, progress: (done: Long, total: Long?) -> Unit) {
-        val out = container.fileStore.downloadFile(path)
-        api.fetchPdf(path, out, progress)
-        if (out.exists() && out.length() > 0) {
-            db.downloadDao().upsert(
-                DownloadEntity(path = path, fileName = out.name, size = out.length(), downloadedAt = nowIso())
-            )
+    fun pageImageModel(path: String, page: Int): Any {
+        val local = container.fileStore.pageImageFile(path, page, CLIENT_PAGE_WIDTH)
+        return if (local.exists() && local.length() > 0) local
+        else api.pageImageUrl(path, page, CLIENT_PAGE_WIDTH)
+    }
+
+    /**
+     * "Downloads" a paper for offline use: caches every server-rendered page
+     * image into app-private storage. Never touches the source PDF.
+     */
+    suspend fun downloadPaperForOffline(
+        path: String,
+        onProgress: (done: Int, total: Int) -> Unit,
+    ) {
+        val meta = api.getPageMeta(path)
+        val total = meta.pageCount.coerceAtLeast(0)
+        var done = 0
+        for (page in 1..total) {
+            val out = container.fileStore.pageImageFile(path, page, CLIENT_PAGE_WIDTH)
+            if (!out.exists() || out.length() == 0L) {
+                api.fetchPageImage(path, page, CLIENT_PAGE_WIDTH, out)
+            }
+            done++
+            onProgress(done, total)
         }
+        val dir = container.fileStore.pagesDir(path, CLIENT_PAGE_WIDTH)
+        val size = dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+        db.downloadDao().upsert(
+            DownloadEntity(path = path, fileName = dir.name, size = size, downloadedAt = nowIso())
+        )
     }
 
     suspend fun removeDownload(path: String) {
-        container.fileStore.deleteDownload(path)
+        container.fileStore.deletePages(path)
         db.downloadDao().delete(path)
-    }
-
-    /**
-     * Returns a local File for the reader. Prefers the permanent download;
-     * otherwise streams the paper into a temporary cache file.
-     */
-    suspend fun fileForReading(
-        path: String,
-        progress: (done: Long, total: Long?) -> Unit = { _, _ -> },
-    ): File {
-        val permanent = container.fileStore.downloadFile(path)
-        if (permanent.exists()) return permanent
-        val cache = container.fileStore.cacheFile(path)
-        if (cache.exists() && cache.length() > 0) return cache
-        api.fetchPdf(path, cache, progress)
-        return cache
     }
 
     suspend fun clearReaderCache() = container.fileStore.clearCache()

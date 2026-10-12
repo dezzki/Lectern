@@ -14,8 +14,8 @@ android {
         applicationId = "com.gigaton.reader"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.6"
+        versionCode = 2
+        versionName = "1.1.0"
     }
 
     buildTypes {
@@ -59,10 +59,8 @@ dependencies {
     implementation("com.squareup.okhttp3:logging-interceptor:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
 
-    // Bundled PDFium engine (Apache-2.0) — bypasses broken platform PdfRenderer
-    implementation("com.github.barteksc:pdfium-android:1.9.0") {
-        exclude(group = "com.android.support")
-    }
+    // Page images (server-rendered) loaded through an authenticated client
+    implementation("io.coil-kt:coil-compose:2.7.0")
 
     // Local persistence
     implementation("androidx.room:room-runtime:2.6.1")

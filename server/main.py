@@ -8,17 +8,20 @@ The papers tree is NEVER written to: there are no create/update/delete/rename
 routes for source files, and the mount is :ro in docker-compose.
 """
 
+import hashlib
 import json
 import os
 import secrets
 import sqlite3
 import uuid
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
+import pypdfium2 as pdfium
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 PAPERS_ROOT = Path(os.getenv("PAPERS_ROOT", "/papers")).resolve()
@@ -29,6 +32,7 @@ SCHEMA_VERSION = 1
 VALID_KINDS = {"highlight", "note", "ink", "bookmark"}
 MAX_PAYLOAD_BYTES = 1_000_000  # 1 MB annotation payload
 MAX_REQUEST_BYTES = 2_100_000  # covers payload + envelope
+MAX_PAGE_WIDTH = 2000          # upper bound for server-rendered page PNGs
 
 app = FastAPI(
     title="GIGATON Research Reader API",
@@ -232,6 +236,105 @@ def get_file(path: str = Query(...)):
         filename=target.name,
         content_disposition_type="inline",
     )
+
+
+# --------------------------------------------------------------------------- #
+# Server-side page rendering (Option B)
+#
+# The Android reader shows png pages rendered HERE, so the phone never needs a
+# PDF engine (several devices ship broken ones). Renders are cached under
+# /data/pagecache keyed by path+page+width+source mtime, so revisits are cheap
+# and the source papers are never modified.
+# --------------------------------------------------------------------------- #
+
+_PAGE_CACHE_DIR = None
+
+
+def page_cache_dir() -> Path:
+    global _PAGE_CACHE_DIR
+    if _PAGE_CACHE_DIR is None:
+        _PAGE_CACHE_DIR = Path(DB_PATH).parent / "pagecache"
+        _PAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return _PAGE_CACHE_DIR
+
+
+def page_cache_path(path: str, page: int, width: int, mtime_ns: int, size: int) -> Path:
+    key = hashlib.sha256(
+        f"{path}|{page}|{width}|{mtime_ns}|{size}".encode("utf-8")
+    ).hexdigest()
+    return page_cache_dir() / f"{key}.png"
+
+
+@app.get("/api/meta", dependencies=[Depends(auth)])
+def get_page_meta(path: str = Query(...)):
+    target = safe_path(path)
+    if not target.is_file() or target.suffix.lower() != ".pdf":
+        raise HTTPException(404, "PDF not found")
+    pdf = None
+    try:
+        pdf = pdfium.PdfDocument(str(target), autoclose=True)
+        pages = []
+        for i in range(len(pdf)):
+            page = pdf[i]
+            w_pt, h_pt = page.get_size()
+            pages.append(
+                {"page": i + 1, "width_pt": float(w_pt), "height_pt": float(h_pt)}
+            )
+        return {"path": path, "page_count": len(pdf), "pages": pages}
+    except HTTPException as exc:
+        raise exc
+    except Exception as exc:
+        raise HTTPException(422, f"Could not parse PDF: {exc}") from exc
+    finally:
+        if pdf is not None:
+            try:
+                pdf.close()
+            except Exception:
+                pass
+
+
+@app.get("/api/page", dependencies=[Depends(auth)])
+def get_page_image(
+    path: str = Query(...),
+    page: int = Query(ge=1),
+    max_width: int = Query(default=1400, ge=64, le=MAX_PAGE_WIDTH),
+):
+    target = safe_path(path)
+    if not target.is_file() or target.suffix.lower() != ".pdf":
+        raise HTTPException(404, "PDF not found")
+    stat = target.stat()
+    cache = page_cache_path(path, page, max_width, stat.st_mtime_ns, stat.st_size)
+    if cache.exists():
+        return Response(cache.read_bytes(), media_type="image/png")
+
+    pdf = None
+    try:
+        pdf = pdfium.PdfDocument(str(target), autoclose=True)
+        if page > len(pdf):
+            raise HTTPException(404, f"Page {page} does not exist")
+        pdf_page = pdf[page - 1]
+        w_pt, _ = pdf_page.get_size()
+        scale = max_width / w_pt if w_pt > 0 else 1.0
+        bitmap = pdf_page.render(scale=scale, fill_color=(255, 255, 255, 255))
+        image = bitmap.to_pil()
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        png = buffer.getvalue()
+        try:
+            cache.write_bytes(png)
+        except OSError:
+            pass  # cache is best-effort
+        return Response(png, media_type="image/png")
+    except HTTPException as exc:
+        raise exc
+    except Exception as exc:
+        raise HTTPException(422, f"Could not render page: {exc}") from exc
+    finally:
+        if pdf is not None:
+            try:
+                pdf.close()
+            except Exception:
+                pass
 
 
 # --------------------------------------------------------------------------- #
