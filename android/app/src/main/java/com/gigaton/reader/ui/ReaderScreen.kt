@@ -73,7 +73,6 @@ import com.gigaton.reader.ui.pdf.AnnotatedPage
 import com.gigaton.reader.ui.pdf.InkStrokeNorm
 import com.gigaton.reader.ui.pdf.MAX_RENDER_WIDTH_PX
 import com.gigaton.reader.ui.pdf.OffsetNorm
-import com.gigaton.reader.ui.pdf.PdfDocument
 import com.gigaton.reader.ui.pdf.PdfiumDocument
 import com.gigaton.reader.ui.pdf.QuadNorm
 import com.gigaton.reader.ui.pdf.ReaderDocument
@@ -138,20 +137,20 @@ fun ReaderScreen(
             return@LaunchedEffect
         }
 
-        // Primary: bundled PDFium (bypasses broken platform PdfRenderer).
-        // Fallback: platform PdfRenderer.
-        val d = runCatching {
-            withContext(Dispatchers.IO) { PdfiumDocument.open(container.appContext, file) }
-        }.getOrNull()
-            ?: runCatching {
-                withContext(Dispatchers.IO) { PdfDocument.open(file) }
-            }.getOrNull()
+        // PDFium-only rendering: the platform PdfRenderer is a known dead end on
+        // this device; never silently fall back to it again. If PDFium cannot
+        // open the file, show the REAL reason instead of a generic message.
+        val attempted = withContext(Dispatchers.IO) {
+            runCatching { PdfiumDocument.open(container.appContext, file) }
+        }
+        val d = attempted.getOrNull()
         if (d == null) {
+            val err = attempted.exceptionOrNull()
             runCatching {
                 (container.appContext as com.gigaton.reader.GigatonReaderApp)
-                    .logRuntimeError("open document", IllegalStateException("both renderers failed for $paperPath"))
+                    .logRuntimeError("pdfium open for $paperPath", err ?: IllegalStateException("unknown open failure"))
             }
-            fileError = "This PDF could not be opened on this device."
+            fileError = "The PDF engine couldn't open this file. ${err?.let { "${it::class.simpleName}: ${it.message}" } ?: "Unknown open error."}"
         } else {
             doc = d
         }
