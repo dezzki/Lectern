@@ -94,7 +94,7 @@ fun AnnotatedPage(
     var dragCurrent by remember { mutableStateOf<Offset?>(null) }
 
     val interactionModifier = when (tool) {
-        ToolMode.PEN -> Modifier.pointerInput(pageIndex) {
+        ToolMode.PEN -> Modifier.pointerInput(pageIndex, tool) {
             detectDragGestures(
                 onDragStart = { pos ->
                     liveInk = listOf(pos.toNorm(size))
@@ -110,7 +110,7 @@ fun AnnotatedPage(
                 onDragCancel = { liveInk = emptyList() },
             )
         }
-        ToolMode.HIGHLIGHT -> Modifier.pointerInput(pageIndex) {
+        ToolMode.HIGHLIGHT -> Modifier.pointerInput(pageIndex, tool) {
             detectDragGestures(
                 onDragStart = { dragStart = it },
                 onDrag = { change, _ -> dragCurrent = change.position; change.consume() },
@@ -129,7 +129,7 @@ fun AnnotatedPage(
                 onDragCancel = { dragStart = null; dragCurrent = null },
             )
         }
-        ToolMode.NOTE -> Modifier.pointerInput(pageIndex) {
+        ToolMode.NOTE -> Modifier.pointerInput(pageIndex, tool) {
             detectTapGestures { pos -> onNoteTap(pageIndex, pos.toNorm(size)) }
         }
         ToolMode.NONE -> Modifier

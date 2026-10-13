@@ -157,14 +157,14 @@ class Repository(private val container: AppContainer) {
             .onFailure { /* offline reads still show local state */ }
     }
 
-    /** Creates or updates an annotation (local-first, then queued sync). */
+    /** Creates or updates an annotation (local-first, then queued sync). Returns the id. */
     suspend fun saveAnnotation(
         paperPath: String,
         page: Int,
         kind: String,
         payload: JsonObject,
         id: String? = null,
-    ) {
+    ): String {
         val aid = id ?: UUID.randomUUID().toString()
         val now = nowIso()
         db.annotationDao().upsert(
@@ -182,6 +182,7 @@ class Repository(private val container: AppContainer) {
             OutboxEntity(op = "annotation_put", body = json.encodeToString(AnnotationPut.serializer(), put), createdAt = now)
         )
         syncAll()
+        return aid
     }
 
     suspend fun deleteAnnotation(id: String) {

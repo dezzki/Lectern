@@ -41,6 +41,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -50,6 +52,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -181,11 +184,28 @@ fun ReaderScreen(
     var jumpDialog by remember { mutableStateOf(false) }
     var jumpText by remember { mutableStateOf("") }
 
-    val currentAnnotations = annotations.filter { it.page == currentPage }
+    // Session undo: every annotation created while this paper is open, on any
+    // page, with any tool. The stack is cleared when the reader closes.
+    data class UndoOp(val label: String, val id: String)
+    val undoStack = remember { mutableStateListOf<UndoOp>() }
+    val snackbarHostState = remember { SnackbarHostState() }
 
     fun save(kind: String, payload: kotlinx.serialization.json.JsonObject, page: Int) {
+        val id = java.util.UUID.randomUUID().toString()
         scope.launch {
-            runCatching { repository.saveAnnotation(paperPath, page, kind, payload) }
+            val ok = runCatching {
+                repository.saveAnnotation(paperPath, page, kind, payload, id = id)
+            }.isSuccess
+            if (ok) undoStack.add(UndoOp(labelFor(kind), id))
+        }
+    }
+
+    fun undo() {
+        if (undoStack.isEmpty()) return
+        val op = undoStack.removeAt(undoStack.size - 1)
+        scope.launch {
+            runCatching { repository.deleteAnnotation(op.id) }
+            snackbarHostState.showSnackbar("Undid ${op.label}")
         }
     }
 
@@ -200,13 +220,6 @@ fun ReaderScreen(
         noteText = ""
     }
 
-    fun undoLastInk() {
-        val last = annotations
-            .filter { it.page == currentPage && it.kind == "ink" }
-            .maxByOrNull { it.createdAt ?: "" } ?: return
-        scope.launch { runCatching { repository.deleteAnnotation(last.id) } }
-    }
-
     fun addBookmark() {
         save("bookmark", Payloads.bookmark("Page $currentPage", null), currentPage)
     }
@@ -215,6 +228,7 @@ fun ReaderScreen(
     // body
     // ------------------------------------------------------------------ //
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 title = {
@@ -250,8 +264,8 @@ fun ReaderScreen(
                 ToolChip(selected = tool == ToolMode.PEN, icon = { Icon(Icons.Filled.Create, null, Modifier.size(20.dp)) }, label = "Pen") { tool = ToolMode.PEN }
                 ToolChip(selected = tool == ToolMode.NOTE, icon = { Icon(Icons.Filled.Edit, null, Modifier.size(20.dp)) }, label = "Note") { tool = ToolMode.NOTE }
                 Spacer(Modifier.weight(1f))
-                IconButton(onClick = { undoLastInk() }, enabled = tool == ToolMode.PEN) {
-                    Icon(Icons.Filled.Undo, "Undo last ink stroke")
+                IconButton(onClick = { undo() }, enabled = undoStack.isNotEmpty()) {
+                    Icon(Icons.Filled.Undo, "Undo last annotation")
                 }
                 IconButton(onClick = { zoom = (zoom * 1.25f).coerceAtMost(4f) }) {
                     Icon(Icons.Filled.ZoomIn, "Zoom in")
@@ -395,6 +409,14 @@ fun ReaderScreen(
             dismissButton = { TextButton(onClick = { jumpDialog = false }) { Text("Cancel") } },
         )
     }
+}
+
+private fun labelFor(kind: String): String = when (kind) {
+    "highlight" -> "highlight"
+    "ink" -> "pen stroke"
+    "note" -> "note"
+    "bookmark" -> "bookmark"
+    else -> kind
 }
 
 @Composable
