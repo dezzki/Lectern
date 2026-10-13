@@ -13,6 +13,7 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
 import uuid
 from datetime import datetime, timezone
 from io import BytesIO
@@ -249,6 +250,13 @@ def get_file(path: str = Query(...)):
 
 _PAGE_CACHE_DIR = None
 
+# PDFium is not thread-safe. FastAPI runs these sync endpoints in a thread
+# pool, so two page requests arriving together would call PDFium from two
+# threads at once, which corrupts its global state (every later load then fails
+# with "Data format error") and can crash the process. All PDFium work is
+# serialized through this lock.
+_PDFIUM_LOCK = threading.Lock()
+
 
 def page_cache_dir() -> Path:
     global _PAGE_CACHE_DIR
@@ -270,27 +278,28 @@ def get_page_meta(path: str = Query(...)):
     target = safe_path(path)
     if not target.is_file() or target.suffix.lower() != ".pdf":
         raise HTTPException(404, "PDF not found")
-    pdf = None
-    try:
-        pdf = pdfium.PdfDocument(str(target), autoclose=True)
-        pages = []
-        for i in range(len(pdf)):
-            page = pdf[i]
-            w_pt, h_pt = page.get_size()
-            pages.append(
-                {"page": i + 1, "width_pt": float(w_pt), "height_pt": float(h_pt)}
-            )
-        return {"path": path, "page_count": len(pdf), "pages": pages}
-    except HTTPException as exc:
-        raise exc
-    except Exception as exc:
-        raise HTTPException(422, f"Could not parse PDF: {exc}") from exc
-    finally:
-        if pdf is not None:
-            try:
-                pdf.close()
-            except Exception:
-                pass
+    with _PDFIUM_LOCK:
+        pdf = None
+        try:
+            pdf = pdfium.PdfDocument(str(target), autoclose=True)
+            pages = []
+            for i in range(len(pdf)):
+                page = pdf[i]
+                w_pt, h_pt = page.get_size()
+                pages.append(
+                    {"page": i + 1, "width_pt": float(w_pt), "height_pt": float(h_pt)}
+                )
+            return {"path": path, "page_count": len(pdf), "pages": pages}
+        except HTTPException as exc:
+            raise exc
+        except Exception as exc:
+            raise HTTPException(422, f"Could not parse PDF: {exc}") from exc
+        finally:
+            if pdf is not None:
+                try:
+                    pdf.close()
+                except Exception:
+                    pass
 
 
 @app.get("/api/page", dependencies=[Depends(auth)])
@@ -308,33 +317,34 @@ def get_page_image(
         return Response(cache.read_bytes(), media_type="image/png")
 
     pdf = None
-    try:
-        pdf = pdfium.PdfDocument(str(target), autoclose=True)
-        if page > len(pdf):
-            raise HTTPException(404, f"Page {page} does not exist")
-        pdf_page = pdf[page - 1]
-        w_pt, _ = pdf_page.get_size()
-        scale = max_width / w_pt if w_pt > 0 else 1.0
-        bitmap = pdf_page.render(scale=scale, fill_color=(255, 255, 255, 255))
-        image = bitmap.to_pil()
-        buffer = BytesIO()
-        image.save(buffer, format="PNG")
-        png = buffer.getvalue()
+    with _PDFIUM_LOCK:
         try:
-            cache.write_bytes(png)
-        except OSError:
-            pass  # cache is best-effort
-        return Response(png, media_type="image/png")
-    except HTTPException as exc:
-        raise exc
-    except Exception as exc:
-        raise HTTPException(422, f"Could not render page: {exc}") from exc
-    finally:
-        if pdf is not None:
+            pdf = pdfium.PdfDocument(str(target), autoclose=True)
+            if page > len(pdf):
+                raise HTTPException(404, f"Page {page} does not exist")
+            pdf_page = pdf[page - 1]
+            w_pt, _ = pdf_page.get_size()
+            scale = max_width / w_pt if w_pt > 0 else 1.0
+            bitmap = pdf_page.render(scale=scale, fill_color=(255, 255, 255, 255))
+            image = bitmap.to_pil()
+            buffer = BytesIO()
+            image.save(buffer, format="PNG")
+            png = buffer.getvalue()
             try:
-                pdf.close()
-            except Exception:
-                pass
+                cache.write_bytes(png)
+            except OSError:
+                pass  # cache is best-effort
+            return Response(png, media_type="image/png")
+        except HTTPException as exc:
+            raise exc
+        except Exception as exc:
+            raise HTTPException(422, f"Could not render page: {exc}") from exc
+        finally:
+            if pdf is not None:
+                try:
+                    pdf.close()
+                except Exception:
+                    pass
 
 
 # --------------------------------------------------------------------------- #
