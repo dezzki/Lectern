@@ -71,8 +71,12 @@ class Repository(private val container: AppContainer) {
     // ------------------------------------------------------------------ //
 
     companion object {
-        /** Width (px) used for page images; kept equal for offline cache hits. */
-        const val CLIENT_PAGE_WIDTH = 1400
+        /**
+         * Width (px) for page images. Kept modest because a page is often
+         * fetched over a high-latency Tailscale link; 1100 is sharp enough to
+         * read and zoom into, and much smaller to transfer than 1400.
+         */
+        const val CLIENT_PAGE_WIDTH = 1100
     }
 
     fun downloads(): Flow<List<DownloadEntity>> = db.downloadDao().all()

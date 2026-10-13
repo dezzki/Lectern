@@ -1,6 +1,10 @@
 FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
+# libarchive is used to read .cbr (RAR) comic archives.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libarchive13 \
+ && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .

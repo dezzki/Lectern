@@ -40,6 +40,17 @@ receives finished PNGs, so it does not need a PDF engine at all. The app is smal
 - Stores the API URL and token in Android's encrypted preferences. The token is not shown
   or logged after you enter it.
 
+## Supported files
+
+- **PDF** — rendered page by page with PDFium.
+- **CBZ / CBR / CBT** — comic archives (zip / rar / tar of images). Pages are read straight
+  out of the archive in natural order (`page2` before `page10`) and served as images, so
+  the app treats them exactly like PDFs. Nothing is extracted to disk.
+
+CBR needs `libarchive` (installed in the image). `.cb7` (7-Zip archives) is not supported
+yet; it would need the `py7zr` package. EPUB is not supported — it needs a layout engine,
+which is a different kind of reader.
+
 ## Repository layout
 
 ```
@@ -66,7 +77,7 @@ directory on disk. The intended install directory is `/opt/gigaton/compose/resea
 
 ```bash
 sudo mkdir -p /opt/gigaton/compose/research-reader/data
-sudo test -d /storage/magnamite/learningPapers
+sudo test -d /storage/miltank/Media/Read
 
 # copy docker-compose.yml, server/, and .env.example into that directory, then:
 cd /opt/gigaton/compose/research-reader
@@ -84,15 +95,20 @@ docker compose logs -f
 Change `SERVER_BIND_IP` if that address moves. Do not bind `0.0.0.0` unless a firewall rule
 already limits access to the tailnet.
 
-The container mounts `/storage/magnamite/learningPapers:/papers:ro` and keeps its database
+The container mounts `/storage/miltank/Media/Read:/papers:ro` and keeps its database
 under `./data`.
 
 ### Container user
 
-The image runs as uid 10001 with gid 1001, which matches the host group that owns the
-paper files. That is enough to read the library without changing file permissions on the
-host. The `data` directory has to be writable by that user, which is why the `chown` step
-above is there.
+The image runs as uid 10001 with gid 1001, and `docker-compose.yml` adds the host groups
+`1000` and `1001` to it. That combination lets it read files owned by the host user
+(uid 1000) as well as older files owned by the `gigatonshare` group (gid 1001), without
+changing ownership on the host. If you move the library and files end up in a group the
+container does not have, add that gid to `group_add` — the symptom is HTTP 422 with
+"File access error" in the API, or "Permission denied" for the container user.
+
+The `data` directory has to be writable by the container user, which is why the `chown`
+step above is there.
 
 ### API
 
@@ -100,8 +116,8 @@ above is there.
 |---|---|---|
 | GET | `/api/health` | Health check. No token required. |
 | GET | `/api/browse?path=&limit=&offset=` | List folders and PDFs under the root |
-| GET | `/api/meta?path=` | Page count and page sizes for a PDF |
-| GET | `/api/page?path=&page=&max_width=` | PNG of one rendered page |
+| GET | `/api/meta?path=` | Page count and page sizes for a PDF or comic |
+| GET | `/api/page?path=&page=&max_width=&format=` | One rendered page image (JPEG by default, `format=png` available) |
 | GET | `/api/file?path=` | Stream the original PDF |
 | GET | `/api/annotations?paper_path=` | List annotations for a paper |
 | PUT | `/api/annotations` | Create or update an annotation |
@@ -174,6 +190,13 @@ docker compose up -d --build --force-recreate
   the container user can read it.
 - **Pages do not load.** Test the endpoints directly:
   `curl -H "Authorization: Bearer $TOKEN" "http://100.82.221.72:8088/api/meta?path=Harness_papers/01_ReAct_2210.03629.pdf"`.
+  A 422 with "File access error" usually means the container cannot read the file (see
+  "Container user"). A 404 means the path is wrong.
+- **Slow or timing out over a mobile connection.** Page images are the bulk of the traffic.
+  They are served as JPEG (about half the size of PNG) with `immutable` cache headers, so
+  each page is downloaded once and then served from the phone's cache. Check the path with
+  `tailscale ping <phone>` on the server: on mobile it is often a few hundred milliseconds,
+  so the first load of a paper is bound by that link, not by the server.
 - **`unable to open database file` in the logs.** The `data` directory is not writable by
   the container user. Run `sudo chown -R 10001:1001 data`.
 

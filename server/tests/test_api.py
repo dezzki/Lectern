@@ -32,6 +32,10 @@ def api(tmp_path, monkeypatch):
     # A real, renderable 2-page PDF for the /api/meta + /api/page tests.
     (root / "Alpha.pdf").write_bytes(make_renderable_pdf(pages=2))
 
+    # A CBZ comic. Page image widths differ so the natural page order is
+    # observable: page1 (300), page2 (310), page10 (320).
+    (root / "Comic.cbz").write_bytes(make_cbz())
+
     (root / "beta.pdf").write_bytes(b"%PDF-1.4 beta\n")
     (root / "not_a_pdf.txt").write_text("ignore me")
     (root / "Empty_Dir").mkdir()
@@ -50,6 +54,22 @@ def api(tmp_path, monkeypatch):
         yield client
 
     importlib.reload(main)
+
+
+def make_cbz(pages=(("page1.png", 300), ("page10.png", 320), ("page2.png", 310))) -> bytes:
+    import io
+    import zipfile
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, width in pages:
+            image = Image.new("RGB", (width, 400), (40, 80, 120))
+            raw = io.BytesIO()
+            image.save(raw, format="PNG")
+            archive.writestr(name, raw.getvalue())
+    return buffer.getvalue()
 
 
 def make_renderable_pdf(pages: int = 2) -> bytes:
@@ -133,10 +153,10 @@ def test_browse_root_sorts_folders_first_then_pdfs(api):
     assert r.status_code == 200
     body = r.json()
     types = [i["type"] for i in body["items"]]
-    assert types == ["folder", "folder", "pdf", "pdf"]
+    assert types == ["folder", "folder", "pdf", "pdf", "comic"]
 
-    pdfs = [i for i in body["items"] if i["type"] == "pdf"]
-    assert [p["name"] for p in pdfs] == ["Alpha.pdf", "beta.pdf"]
+    docs = [i for i in body["items"] if i["type"] in ("pdf", "comic")]
+    assert [p["name"] for p in docs] == ["Alpha.pdf", "beta.pdf", "Comic.cbz"]
 
     folders = [i for i in body["items"] if i["type"] == "folder"]
     assert {f["name"] for f in folders} == {"Sub Folder", "Empty_Dir"}
@@ -164,7 +184,7 @@ def test_browse_pagination(api):
     r = api.get("/api/browse", params={"limit": 2, "offset": 0}, headers=auth_headers())
     body = r.json()
     assert len(body["items"]) == 2
-    assert body["total"] == 4
+    assert body["total"] == 5
 
 
 def test_browse_skips_symlinks(api):
@@ -421,16 +441,46 @@ def test_page_meta(api):
     assert body["pages"][0]["page"] == 1
 
 
-def test_page_image_renders_png(api):
+def test_page_image_renders_jpeg_by_default(api):
     r = api.get("/api/page", params={"path": "Alpha.pdf", "page": 1, "max_width": 600},
                 headers=auth_headers())
     assert r.status_code == 200
+    assert r.headers["content-type"] == "image/jpeg"
+    assert r.content[:3] == b"\xff\xd8\xff"  # JPEG magic
+    assert len(r.content) > 200
+
+
+def test_page_image_png_format(api):
+    r = api.get("/api/page",
+                params={"path": "Alpha.pdf", "page": 1, "max_width": 600, "format": "png"},
+                headers=auth_headers())
+    assert r.status_code == 200
     assert r.headers["content-type"] == "image/png"
-    assert r.content[:8] == b"\x89PNG\r\n\x1a\n"  # PNG signature
-    assert len(r.content) > 500  # real rendered content, not an empty stub
+    assert r.content[:8] == b"\x89PNG\r\n\x1a\n"
 
 
-def test_page_image_cache_hit(api):
+def test_page_image_etag_and_304(api):
+    h = auth_headers()
+    first = api.get("/api/page", params={"path": "Alpha.pdf", "page": 1, "max_width": 400}, headers=h)
+    assert first.status_code == 200
+    etag = first.headers.get("ETag")
+    assert etag
+    assert "immutable" in first.headers.get("Cache-Control", "")
+
+    again = api.get("/api/page", params={"path": "Alpha.pdf", "page": 1, "max_width": 400},
+                    headers={**h, "If-None-Match": etag})
+    assert again.status_code == 304
+    assert not again.content
+
+
+def test_page_image_rejects_bad_format(api):
+    r = api.get("/api/page",
+                params={"path": "Alpha.pdf", "page": 1, "format": "gif"},
+                headers=auth_headers())
+    assert r.status_code == 400
+
+
+def test_page_image_cached_file_is_reused(api):
     h = auth_headers()
     a = api.get("/api/page", params={"path": "Alpha.pdf", "page": 2, "max_width": 300}, headers=h)
     b = api.get("/api/page", params={"path": "Alpha.pdf", "page": 2, "max_width": 300}, headers=h)
@@ -465,6 +515,60 @@ def test_page_max_width_capped(api):
     r = api.get("/api/page", params={"path": "Alpha.pdf", "page": 1, "max_width": 20000},
                 headers=auth_headers())
     assert r.status_code == 422  # le=2000 bound enforced by validation
+
+
+# --------------------------------------------------------------------------- #
+# Comic archives (cbz)
+# --------------------------------------------------------------------------- #
+
+def test_comic_meta_natural_page_order(api):
+    r = api.get("/api/meta", params={"path": "Comic.cbz"}, headers=auth_headers())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["page_count"] == 3
+    # page1, page2, page10 in natural order -> widths 300, 310, 320
+    assert [int(p["width_pt"]) for p in body["pages"]] == [300, 310, 320]
+    assert all(int(p["height_pt"]) == 400 for p in body["pages"])
+
+
+def test_comic_page_renders_and_scales(api):
+    r = api.get("/api/page", params={"path": "Comic.cbz", "page": 2, "max_width": 150},
+                headers=auth_headers())
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/jpeg"
+    assert r.content[:3] == b"\xff\xd8\xff"
+    from io import BytesIO as _BytesIO
+
+    from PIL import Image as _Image
+
+    with _Image.open(_BytesIO(r.content)) as image:
+        assert image.width == 150  # scaled down from 310
+
+
+def test_comic_page_out_of_range(api):
+    h = auth_headers()
+    assert api.get("/api/page", params={"path": "Comic.cbz", "page": 99}, headers=h).status_code == 404
+
+
+def test_comic_page_requires_auth(api):
+    assert api.get("/api/meta", params={"path": "Comic.cbz"}).status_code == 401
+    assert api.get("/api/page", params={"path": "Comic.cbz", "page": 1}).status_code == 401
+
+
+def test_comic_page_cache_hit(api):
+    h = auth_headers()
+    a = api.get("/api/page", params={"path": "Comic.cbz", "page": 1, "max_width": 200}, headers=h)
+    b = api.get("/api/page", params={"path": "Comic.cbz", "page": 1, "max_width": 200}, headers=h)
+    assert a.status_code == 200 and b.status_code == 200
+    assert a.content == b.content
+
+
+def test_bad_archive_reports_422(api, tmp_path):
+    # A .cbz that is not a zip at all.
+    bad = main.PAPERS_ROOT / "Broken.cbz"
+    bad.write_bytes(b"not a zip")
+    r = api.get("/api/meta", params={"path": "Broken.cbz"}, headers=auth_headers())
+    assert r.status_code == 422
 
 
 # --------------------------------------------------------------------------- #

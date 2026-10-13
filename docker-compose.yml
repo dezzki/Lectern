@@ -9,14 +9,20 @@ services:
       PAPERS_ROOT: /papers
       DB_PATH: /data/reader.db
       READER_API_TOKEN: ${READER_API_TOKEN:?Set READER_API_TOKEN in .env}
+    # The library is owned by the host user (uid 1000); older files are owned by
+    # the "gigatonshare" group (gid 1001). Give the container both groups so it
+    # can read anything in the library without changing file ownership.
+    group_add:
+      - "1000"
+      - "1001"
     ports:
       # Bind only to the Tailscale interface by default. If Tailscale is not up
       # yet, use:  SERVER_BIND_IP=127.0.0.1 docker compose up -d
       # Never set SERVER_BIND_IP=0.0.0.0 without a firewall rule in place.
       - "${SERVER_BIND_IP:-100.82.221.72}:8088:8080"
     volumes:
-      # Read-only mount of the research papers. The API never writes here.
-      - /storage/magnamite/learningPapers:/papers:ro
+      # Read-only mount of the library. The API never writes here.
+      - /storage/miltank/Media/Read:/papers:ro
       # Persistent app database (annotations + progress).
       - ./data:/data
     healthcheck:

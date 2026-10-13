@@ -11,10 +11,13 @@ routes for source files, and the mount is :ro in docker-compose.
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
+import tarfile
 import threading
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -23,6 +26,7 @@ from typing import Optional
 import pypdfium2 as pdfium
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
+from PIL import Image
 from pydantic import BaseModel, Field
 
 PAPERS_ROOT = Path(os.getenv("PAPERS_ROOT", "/papers")).resolve()
@@ -34,6 +38,12 @@ VALID_KINDS = {"highlight", "note", "ink", "bookmark"}
 MAX_PAYLOAD_BYTES = 1_000_000  # 1 MB annotation payload
 MAX_REQUEST_BYTES = 2_100_000  # covers payload + envelope
 MAX_PAGE_WIDTH = 2000          # upper bound for server-rendered page PNGs
+
+# Comic archives: a zip/rar/tar/7z of page images.
+IMAGE_EXTS = {".jpg", ".jpeg", ".jfif", ".png", ".webp", ".gif", ".bmp", ".avif"}
+COMIC_EXTS = {".cbz", ".cbr", ".cbt"}
+MAX_COMIC_ENTRIES = 5000
+MAX_ENTRY_BYTES = 64 * 1024 * 1024  # cap per image entry (blunts archive bombs)
 
 app = FastAPI(
     title="GIGATON Research Reader API",
@@ -206,13 +216,16 @@ def browse(
         rel = p.relative_to(PAPERS_ROOT).as_posix()
         if p.is_dir():
             items.append({"name": p.name, "path": rel, "type": "folder"})
-        elif p.is_file() and p.suffix.lower() == ".pdf":
+        elif p.is_file():
+            kind = document_kind(p)
+            if kind is None:
+                continue
             stat = p.stat()
             items.append(
                 {
                     "name": p.name,
                     "path": rel,
-                    "type": "pdf",
+                    "type": kind,
                     "size": stat.st_size,
                     "modified": datetime.fromtimestamp(
                         stat.st_mtime, tz=timezone.utc
@@ -266,18 +279,177 @@ def page_cache_dir() -> Path:
     return _PAGE_CACHE_DIR
 
 
-def page_cache_path(path: str, page: int, width: int, mtime_ns: int, size: int) -> Path:
+def page_cache_path(path: str, page: int, width: int, mtime_ns: int, size: int, fmt: str) -> Path:
     key = hashlib.sha256(
-        f"{path}|{page}|{width}|{mtime_ns}|{size}".encode("utf-8")
+        f"{path}|{page}|{width}|{fmt}|{mtime_ns}|{size}".encode("utf-8")
     ).hexdigest()
-    return page_cache_dir() / f"{key}.png"
+    return page_cache_dir() / f"{key}.{fmt}"
+
+
+# --------------------------------------------------------------------------- #
+# Comic archives (cbz / cbr / cbt / cb7)
+#
+# A comic is just an archive of page images. Pages are read straight out of the
+# archive in memory and served as images, the same way PDF pages are, so the
+# Android reader needs no changes. Nothing is ever extracted to disk.
+# --------------------------------------------------------------------------- #
+
+def document_kind(target: Path) -> Optional[str]:
+    suffix = target.suffix.lower()
+    if suffix == ".pdf":
+        return "pdf"
+    if suffix in COMIC_EXTS:
+        return "comic"
+    return None
+
+
+def _natural_key(name: str):
+    # "page2" sorts before "page10"
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", name)]
+
+
+def _is_page_image(name: str) -> bool:
+    base = name.rsplit("/", 1)[-1]
+    if not base or base.startswith("."):
+        return False
+    if "__MACOSX" in name:
+        return False
+    return Path(base).suffix.lower() in IMAGE_EXTS
+
+
+def list_comic_entries(target: Path) -> list:
+    """Page image entries in natural order. Reads names only."""
+    suffix = target.suffix.lower()
+    names = []
+    try:
+        if suffix == ".cbz":
+            with zipfile.ZipFile(target) as archive:
+                for name in archive.namelist():
+                    if name.endswith("/"):
+                        continue
+                    if _is_page_image(name):
+                        names.append(name)
+        elif suffix == ".cbt":
+            with tarfile.open(target) as archive:
+                for member in archive.getmembers():
+                    if member.isfile() and _is_page_image(member.name):
+                        names.append(member.name)
+        elif suffix == ".cbr":
+            import libarchive
+
+            with libarchive.file_reader(str(target)) as archive:
+                for entry in archive:
+                    if entry.isfile and _is_page_image(entry.pathname):
+                        names.append(entry.pathname)
+        else:
+            raise HTTPException(400, "Unsupported archive type")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(422, f"Could not read archive: {exc}") from exc
+
+    names = sorted(names, key=_natural_key)
+    if len(names) > MAX_COMIC_ENTRIES:
+        raise HTTPException(413, "Archive has too many entries")
+    return names
+
+
+def read_comic_entry(target: Path, name: str) -> bytes:
+    suffix = target.suffix.lower()
+    if suffix == ".cbz":
+        with zipfile.ZipFile(target) as archive:
+            return archive.read(name)
+    if suffix == ".cbt":
+        with tarfile.open(target) as archive:
+            handle = archive.extractfile(name)
+            if handle is None:
+                raise HTTPException(404, "Entry not found")
+            return handle.read()
+    if suffix == ".cbr":
+        import libarchive
+
+        with libarchive.file_reader(str(target)) as archive:
+            for entry in archive:
+                if entry.isfile and entry.pathname == name:
+                    return b"".join(entry.get_blocks())
+        raise HTTPException(404, "Entry not found")
+    raise HTTPException(400, "Unsupported archive type")
+
+
+def comic_meta(target: Path, path: str) -> dict:
+    """Page count and pixel dimensions, cached because it reads every image."""
+    stat = target.stat()
+    cache = page_cache_dir() / (
+        hashlib.sha256(f"meta|{path}|{stat.st_mtime_ns}|{stat.st_size}".encode("utf-8")).hexdigest()
+        + ".json"
+    )
+    if cache.exists():
+        try:
+            return json.loads(cache.read_text())
+        except (OSError, ValueError):
+            pass
+
+    names = list_comic_entries(target)
+    if not names:
+        raise HTTPException(422, "No page images found in this archive")
+    pages = []
+    total = 0
+    for index, name in enumerate(names, start=1):
+        data = read_comic_entry(target, name)
+        total += len(data)
+        if total > MAX_ENTRY_BYTES * 8:
+            raise HTTPException(413, "Archive is too large")
+        try:
+            with Image.open(BytesIO(data)) as image:
+                width, height = image.size
+        except Exception as exc:
+            raise HTTPException(422, f"Could not read page {index}: {exc}") from exc
+        pages.append({"page": index, "width_pt": float(width), "height_pt": float(height)})
+
+    result = {"path": path, "page_count": len(names), "pages": pages, "kind": "comic"}
+    try:
+        cache.write_text(json.dumps(result))
+    except OSError:
+        pass
+    return result
+
+
+def render_comic_page(target: Path, page: int, max_width: int, fmt: str) -> bytes:
+    names = list_comic_entries(target)
+    if page > len(names):
+        raise HTTPException(404, f"Page {page} does not exist")
+    data = read_comic_entry(target, names[page - 1])
+    if len(data) > MAX_ENTRY_BYTES:
+        raise HTTPException(413, "Page image is too large")
+    try:
+        with Image.open(BytesIO(data)) as image:
+            image = image.convert("RGB")
+            if image.width > max_width:
+                scale = max_width / image.width
+                image = image.resize(
+                    (max_width, max(1, round(image.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            buffer = BytesIO()
+            if fmt == "jpeg":
+                image.save(buffer, format="JPEG", quality=85, optimize=True)
+            else:
+                image.save(buffer, format="PNG")
+            return buffer.getvalue()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(422, f"Could not render page: {exc}") from exc
 
 
 @app.get("/api/meta", dependencies=[Depends(auth)])
 def get_page_meta(path: str = Query(...)):
     target = safe_path(path)
-    if not target.is_file() or target.suffix.lower() != ".pdf":
-        raise HTTPException(404, "PDF not found")
+    kind = document_kind(target) if target.is_file() else None
+    if kind is None:
+        raise HTTPException(404, "Document not found")
+    if kind == "comic":
+        return comic_meta(target, path)
     with _PDFIUM_LOCK:
         pdf = None
         try:
@@ -304,17 +476,40 @@ def get_page_meta(path: str = Query(...)):
 
 @app.get("/api/page", dependencies=[Depends(auth)])
 def get_page_image(
+    request: Request,
     path: str = Query(...),
     page: int = Query(ge=1),
-    max_width: int = Query(default=1400, ge=64, le=MAX_PAGE_WIDTH),
+    max_width: int = Query(default=1100, ge=64, le=MAX_PAGE_WIDTH),
+    fmt: str = Query(default="jpeg", alias="format"),
 ):
     target = safe_path(path)
-    if not target.is_file() or target.suffix.lower() != ".pdf":
-        raise HTTPException(404, "PDF not found")
+    kind = document_kind(target) if target.is_file() else None
+    if kind is None:
+        raise HTTPException(404, "Document not found")
+    fmt = fmt.lower()
+    if fmt not in ("jpeg", "png"):
+        raise HTTPException(400, "Unsupported format (use jpeg or png)")
+
     stat = target.stat()
-    cache = page_cache_path(path, page, max_width, stat.st_mtime_ns, stat.st_size)
+    cache = page_cache_path(path, page, max_width, stat.st_mtime_ns, stat.st_size, fmt)
+    media = "image/jpeg" if fmt == "jpeg" else "image/png"
+    # Pages are immutable for a given file+page+width, so clients (and Coil on
+    # the phone) can cache them aggressively. This matters a lot over a slow
+    # Tailscale link: a page is fetched once, not on every scroll.
+    etag = '"' + cache.stem + '"'
+    headers = {"ETag": etag, "Cache-Control": "private, max-age=31536000, immutable"}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
     if cache.exists():
-        return Response(cache.read_bytes(), media_type="image/png")
+        return Response(cache.read_bytes(), media_type=media, headers=headers)
+
+    if kind == "comic":
+        data = render_comic_page(target, page, max_width, fmt)
+        try:
+            cache.write_bytes(data)
+        except OSError:
+            pass
+        return Response(data, media_type=media, headers=headers)
 
     pdf = None
     with _PDFIUM_LOCK:
@@ -328,13 +523,18 @@ def get_page_image(
             bitmap = pdf_page.render(scale=scale, fill_color=(255, 255, 255, 255))
             image = bitmap.to_pil()
             buffer = BytesIO()
-            image.save(buffer, format="PNG")
-            png = buffer.getvalue()
+            if fmt == "jpeg":
+                # JPEG is several times smaller than PNG for scanned/text pages,
+                # which cuts transfer time on slow links.
+                image.convert("RGB").save(buffer, format="JPEG", quality=85, optimize=True)
+            else:
+                image.save(buffer, format="PNG")
+            data = buffer.getvalue()
             try:
-                cache.write_bytes(png)
+                cache.write_bytes(data)
             except OSError:
                 pass  # cache is best-effort
-            return Response(png, media_type="image/png")
+            return Response(data, media_type=media, headers=headers)
         except HTTPException as exc:
             raise exc
         except Exception as exc:
