@@ -200,7 +200,7 @@ fun BrowseScreen(
                                 }
                             },
                             onToggleDownload = {
-                                if (entry.type != EntryType.PDF) return@BrowseRow
+                                if (entry.type == EntryType.FOLDER) return@BrowseRow
                                 if (downloaded) {
                                     scope.launch { repository.removeDownload(entry.path) }
                                 } else {
@@ -219,7 +219,7 @@ fun BrowseScreen(
                                 }
                             },
                             onAnnotations = {
-                                if (entry.type == EntryType.PDF) onOpenAnnotations(entry.path, entry.name)
+                                if (entry.type != EntryType.FOLDER) onOpenAnnotations(entry.path, entry.name)
                             },
                         )
                     }
@@ -265,7 +265,7 @@ private fun BrowseRow(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            if (entry.type == EntryType.PDF) {
+            if (entry.type != EntryType.FOLDER) {
                 if (progress != null) {
                     CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                 } else {
