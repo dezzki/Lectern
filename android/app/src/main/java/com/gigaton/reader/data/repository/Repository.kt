@@ -89,31 +89,39 @@ class Repository(private val container: AppContainer) {
         container.pageStore.pinnedCount(path) > 0
 
     /**
-     * Page metadata (page count + page sizes) for a paper. Always cached on
-     * success, and served from the cache when the server can't be reached, so
-     * a downloaded paper opens with no network.
+     * Page metadata (page count + page sizes) for a paper.
+     *
+     * Local-first: a downloaded paper is answered entirely from storage and
+     * never waits on the network. Otherwise the server is asked (and the answer
+     * cached), falling back to the cache when the server can't be reached.
      */
     suspend fun pageMeta(path: String, allowNetwork: Boolean = true): PageMetaDto {
+        val downloaded = runCatching { container.pageStore.pinnedCount(path) }.getOrDefault(0) > 0
+        if (downloaded) {
+            localMeta(path)?.let { return it }
+        }
         if (allowNetwork) {
             val fetched = runCatching { api.getPageMeta(path) }
             fetched.getOrNull()?.let { meta ->
-                container.pageStore.saveMeta(path, json.encodeToString(PageMetaDto.serializer(), meta))
+                runCatching {
+                    container.pageStore.saveMeta(path, json.encodeToString(PageMetaDto.serializer(), meta))
+                }
                 return meta
             }
-            container.pageStore.loadMeta(path)?.let { cached ->
-                runCatching { return json.decodeFromString(PageMetaDto.serializer(), cached) }
-            }
+            localMeta(path)?.let { return it }
             throw (fetched.exceptionOrNull() as? ApiException)
                 ?: ApiException(ApiErrorKind.UNREACHABLE, "Cannot reach GIGATON")
         }
-        container.pageStore.loadMeta(path)?.let { cached ->
-            return runCatching { json.decodeFromString(PageMetaDto.serializer(), cached) }
-                .getOrElse { throw ApiException(ApiErrorKind.UNREACHABLE, "Cached page info is unreadable") }
-        }
-        // No cached metadata (for example a paper downloaded by an older build).
-        // Rebuild it from the page images already on disk so it still opens.
-        synthesizeMetaFromDisk(path)?.let { return it }
+        localMeta(path)?.let { return it }
         throw ApiException(ApiErrorKind.UNREACHABLE, "Offline and this paper is not cached")
+    }
+
+    /** Cached page metadata, or metadata rebuilt from the page images on disk. */
+    private suspend fun localMeta(path: String): PageMetaDto? {
+        container.pageStore.loadMeta(path)?.let { cached ->
+            runCatching { return json.decodeFromString(PageMetaDto.serializer(), cached) }
+        }
+        return synthesizeMetaFromDisk(path)
     }
 
     /** Builds page metadata from locally stored page images, if any exist. */
@@ -243,6 +251,8 @@ class Repository(private val container: AppContainer) {
      */
     suspend fun autoCachePaper(path: String, fromPage: Int, onProgress: (done: Int, total: Int) -> Unit) {
         if (!settings.autoCacheEnabled) return
+        // A downloaded paper is already fully local; nothing to prefetch.
+        if (runCatching { container.pageStore.pinnedCount(path) }.getOrDefault(0) > 0) return
         val meta = runCatching { pageMeta(path) }.getOrNull() ?: return
         val total = meta.pageCount
         if (total <= 0) return
@@ -349,8 +359,8 @@ class Repository(private val container: AppContainer) {
     // Progress
     // ------------------------------------------------------------------ //
 
-    suspend fun loadProgress(paperPath: String): ProgressRec {
-        val server = runCatching { api.getProgress(paperPath) }.getOrNull()
+    suspend fun loadProgress(paperPath: String, allowNetwork: Boolean = true): ProgressRec {
+        val server = if (allowNetwork) runCatching { api.getProgress(paperPath) }.getOrNull() else null
         if (server != null) {
             db.progressDao().upsert(
                 LocalProgressEntity(

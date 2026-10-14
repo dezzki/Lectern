@@ -131,7 +131,9 @@ fun ReaderScreen(
     }
 
     val annotations by repository.annotationsFlow(paperPath).collectAsState(initial = emptyList())
-    LaunchedEffect(paperPath) { repository.refreshAnnotations(paperPath) }
+    LaunchedEffect(paperPath, online) {
+        if (online) repository.refreshAnnotations(paperPath)
+    }
 
     // ------------------------------------------------------------------ //
     // zoom
@@ -152,7 +154,7 @@ fun ReaderScreen(
     val pageCount = meta?.pageCount ?: 0
     LaunchedEffect(meta) {
         val count = meta?.pageCount ?: return@LaunchedEffect
-        val p = repository.loadProgress(paperPath)
+        val p = repository.loadProgress(paperPath, allowNetwork = online)
         currentPage = p.page.coerceIn(1, count)
         runCatching { listState.scrollToItem(currentPage - 1) }
     }
@@ -171,7 +173,9 @@ fun ReaderScreen(
     }
 
     // Cache the whole paper in the background so it becomes readable offline.
-    LaunchedEffect(meta) {
+    // Skipped when offline, and a downloaded paper is already fully local.
+    LaunchedEffect(meta, online) {
+        if (!online) return@LaunchedEffect
         val count = meta?.pageCount ?: return@LaunchedEffect
         if (count <= 0) return@LaunchedEffect
         runCatching { repository.autoCachePaper(paperPath, currentPage) { _, _ -> } }
@@ -321,7 +325,7 @@ fun ReaderScreen(
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Spacer(Modifier.height(120.dp))
-                    Text("Fetching paper…", style = MaterialTheme.typography.bodySmall)
+                    Text("Opening…", style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(12.dp))
                     CircularProgressIndicator()
                 }

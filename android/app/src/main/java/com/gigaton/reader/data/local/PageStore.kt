@@ -77,13 +77,56 @@ class PageStore(
     fun fileFor(serverPath: String, page: Int, pinned: Boolean): File =
         File(dirFor(pinned), fileName(serverPath, page))
 
-    /** The local file for a page, if it exists and is still recorded. */
+    /** The local file for a page, if it exists (checking current and older naming). */
     suspend fun existing(serverPath: String, page: Int): File? {
-        val row = dao.get(serverPath, page) ?: return null
-        val file = fileFor(serverPath, page, row.pinned)
-        if (file.exists() && file.length() > 0) return file
-        dao.delete(serverPath, page) // stale record
-        return null
+        val row = dao.get(serverPath, page)
+        if (row != null) {
+            val file = fileFor(serverPath, page, row.pinned)
+            if (file.exists() && file.length() > 0) return file
+            dao.delete(serverPath, page) // stale record
+        }
+        return candidateFiles(serverPath, page).firstOrNull { it.exists() && it.length() > 0 }
+    }
+
+    /**
+     * Every page image present on disk for a paper, ascending. Scans the
+     * filesystem as well as the database so pages written by older builds (or
+     * whose database rows are missing) are still found.
+     */
+    suspend fun localPages(serverPath: String): List<Int> {
+        val key = safeKey(serverPath)
+        val pages = sortedSetOf<Int>()
+        for (row in dao.forPaper(serverPath)) {
+            if (fileFor(serverPath, row.page, row.pinned).exists()) pages.add(row.page)
+        }
+        val flat = Regex("^${Regex.escape(key)}_p(\\d+)\\.(jpg|png)$")
+        val legacy = Regex("^p(\\d+)\\.(png|jpg)$")
+        for (root in listOf(pinnedDir, cacheDir)) {
+            root.listFiles()?.forEach { file ->
+                if (file.isFile) flat.matchEntire(file.name)?.let { pages.add(it.groupValues[1].toInt()) }
+            }
+            root.listFiles { f -> f.isDirectory && f.name.startsWith("paper-${key}_p") }?.forEach { dir ->
+                dir.listFiles()?.forEach { file ->
+                    legacy.matchEntire(file.name)?.let { pages.add(it.groupValues[1].toInt()) }
+                }
+            }
+        }
+        return pages.toList()
+    }
+
+    /** Candidate file locations for a page, including the pre-1.2 layout. */
+    private fun candidateFiles(serverPath: String, page: Int): List<File> {
+        val key = safeKey(serverPath)
+        val candidates = mutableListOf<File>()
+        for (root in listOf(pinnedDir, cacheDir)) {
+            candidates += File(root, "${key}_p$page.jpg")
+            candidates += File(root, "${key}_p$page.png")
+            root.listFiles { f -> f.isDirectory && f.name.startsWith("paper-${key}_p") }?.forEach { dir ->
+                candidates += File(dir, "p$page.png")
+                candidates += File(dir, "p$page.jpg")
+            }
+        }
+        return candidates
     }
 
     suspend fun touch(serverPath: String, page: Int) {
@@ -113,13 +156,6 @@ class PageStore(
         dao.get(serverPath, page)?.pinned == true
 
     suspend fun pinnedCount(serverPath: String): Int = dao.pinnedCount(serverPath)
-
-    /** Page numbers that actually exist on disk for a paper, ascending. */
-    suspend fun localPages(serverPath: String): List<Int> =
-        dao.forPaper(serverPath)
-            .filter { fileFor(serverPath, it.page, it.pinned).exists() }
-            .map { it.page }
-            .sorted()
 
     suspend fun pinnedBytes(serverPath: String): Long = dao.pinnedBytesFor(serverPath)
 
