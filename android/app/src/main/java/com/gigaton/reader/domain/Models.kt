@@ -1,5 +1,6 @@
 package com.gigaton.reader.domain
 
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -12,6 +13,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
 /** A single entry in a folder listing. */
+@Serializable
 data class BrowseEntry(
     val name: String,
     val path: String,
@@ -20,7 +22,8 @@ data class BrowseEntry(
     val modified: String? = null,
 )
 
-enum class EntryType { FOLDER, PDF }
+@Serializable
+enum class EntryType { FOLDER, PDF, COMIC }
 
 /** Structured error kinds used to render helpful messages in the UI. */
 enum class ApiErrorKind { UNREACHABLE, UNAUTHORIZED, NOT_FOUND, SERVER, OTHER }

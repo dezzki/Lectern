@@ -72,6 +72,7 @@ import com.gigaton.reader.data.network.PageMetaDto
 import com.gigaton.reader.data.repository.Payloads
 import com.gigaton.reader.data.repository.Repository
 import com.gigaton.reader.domain.ApiErrorKind
+import com.gigaton.reader.domain.ApiException
 import com.gigaton.reader.ui.pdf.AnnotatedPage
 import com.gigaton.reader.ui.pdf.InkStrokeNorm
 import com.gigaton.reader.ui.pdf.OffsetNorm
@@ -99,20 +100,25 @@ fun ReaderScreen(
     var loadingPages by remember { mutableStateOf(true) }
     var fetchRetry by remember { mutableIntStateOf(0) }
 
-    LaunchedEffect(paperPath, fetchRetry) {
+    val online by container.networkMonitor.online.collectAsState()
+
+    LaunchedEffect(paperPath, fetchRetry, online) {
         fileError = null
         loadingPages = true
         meta = null
         try {
-            val m = repository.pageMeta(paperPath)
+            // Falls back to the cached page info when offline, so a downloaded
+            // paper opens with no network.
+            val m = repository.pageMeta(paperPath, allowNetwork = online)
             meta = m
         } catch (e: Exception) {
-            val msg = when (e) {
-                is com.gigaton.reader.domain.ApiException -> when (e.kind) {
-                    ApiErrorKind.UNREACHABLE -> "Cannot reach GIGATON. Check Tailscale and try again."
-                    ApiErrorKind.UNAUTHORIZED -> "Invalid API token — fix it in Settings."
-                    else -> e.message ?: "Could not read this paper."
-                }
+            val msg = when {
+                e is ApiException && e.kind == ApiErrorKind.UNREACHABLE && !online ->
+                    "Offline — this paper isn't cached yet. Connect to load it."
+                e is ApiException && e.kind == ApiErrorKind.UNREACHABLE ->
+                    "Cannot reach GIGATON. Check Tailscale and try again."
+                e is ApiException && e.kind == ApiErrorKind.UNAUTHORIZED ->
+                    "Invalid API token — fix it in Settings."
                 else -> e.message ?: "Could not read this paper."
             }
             runCatching {
@@ -126,8 +132,6 @@ fun ReaderScreen(
 
     val annotations by repository.annotationsFlow(paperPath).collectAsState(initial = emptyList())
     LaunchedEffect(paperPath) { repository.refreshAnnotations(paperPath) }
-
-    val online by container.networkMonitor.online.collectAsState()
 
     // ------------------------------------------------------------------ //
     // zoom
@@ -350,7 +354,9 @@ fun ReaderScreen(
                         ) {
                             items(count, key = { it }) { index ->
                                 val pageInfo = meta?.pages?.getOrNull(index)
-                                val ratio = pageInfo?.let { (it.widthPt / it.heightPt).toFloat() } ?: 1f
+                                val ratio = pageInfo?.let {
+                                    if (it.widthPt > 0 && it.heightPt > 0) (it.widthPt / it.heightPt).toFloat() else 1f
+                                } ?: 1f
                                 val pageNumber = index + 1
                                 // Resolve to a local file: pinned/cached copy, or fetch
                                 // and cache when online. Keeps working offline.

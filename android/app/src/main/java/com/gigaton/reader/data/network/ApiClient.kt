@@ -112,7 +112,11 @@ class ApiClient(
             BrowseEntry(
                 name = item.name,
                 path = item.path,
-                type = if (item.type == "folder") EntryType.FOLDER else EntryType.PDF,
+                type = when (item.type) {
+                    "folder" -> EntryType.FOLDER
+                    "comic" -> EntryType.COMIC
+                    else -> EntryType.PDF
+                },
                 size = item.size,
                 modified = item.modified,
             )

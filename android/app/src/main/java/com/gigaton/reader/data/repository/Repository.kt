@@ -5,8 +5,11 @@ import com.gigaton.reader.data.local.AnnotationEntity
 import com.gigaton.reader.data.local.DownloadEntity
 import com.gigaton.reader.data.local.LocalProgressEntity
 import com.gigaton.reader.data.local.OutboxEntity
+import com.gigaton.reader.data.local.PageStore
 import com.gigaton.reader.data.network.AnnotationDto
 import com.gigaton.reader.data.network.AnnotationPut
+import com.gigaton.reader.data.network.PageMetaDto
+import com.gigaton.reader.data.network.PageMetaPageDto
 import com.gigaton.reader.data.network.ProgressPut
 import com.gigaton.reader.domain.AnnotationRec
 import com.gigaton.reader.domain.ApiException
@@ -17,6 +20,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
+import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -84,11 +88,92 @@ class Repository(private val container: AppContainer) {
     suspend fun isDownloaded(path: String): Boolean =
         container.pageStore.pinnedCount(path) > 0
 
-    suspend fun pageMeta(path: String) = api.getPageMeta(path)
+    /**
+     * Page metadata (page count + page sizes) for a paper. Always cached on
+     * success, and served from the cache when the server can't be reached, so
+     * a downloaded paper opens with no network.
+     */
+    suspend fun pageMeta(path: String, allowNetwork: Boolean = true): PageMetaDto {
+        if (allowNetwork) {
+            val fetched = runCatching { api.getPageMeta(path) }
+            fetched.getOrNull()?.let { meta ->
+                container.pageStore.saveMeta(path, json.encodeToString(PageMetaDto.serializer(), meta))
+                return meta
+            }
+            container.pageStore.loadMeta(path)?.let { cached ->
+                runCatching { return json.decodeFromString(PageMetaDto.serializer(), cached) }
+            }
+            throw (fetched.exceptionOrNull() as? ApiException)
+                ?: ApiException(ApiErrorKind.UNREACHABLE, "Cannot reach GIGATON")
+        }
+        container.pageStore.loadMeta(path)?.let { cached ->
+            return runCatching { json.decodeFromString(PageMetaDto.serializer(), cached) }
+                .getOrElse { throw ApiException(ApiErrorKind.UNREACHABLE, "Cached page info is unreadable") }
+        }
+        // No cached metadata (for example a paper downloaded by an older build).
+        // Rebuild it from the page images already on disk so it still opens.
+        synthesizeMetaFromDisk(path)?.let { return it }
+        throw ApiException(ApiErrorKind.UNREACHABLE, "Offline and this paper is not cached")
+    }
+
+    /** Builds page metadata from locally stored page images, if any exist. */
+    private suspend fun synthesizeMetaFromDisk(path: String): PageMetaDto? {
+        val localPages = container.pageStore.localPages(path)
+        if (localPages.isEmpty()) return null
+        val present = localPages.toSet()
+        val maxPage = localPages.max()
+        val pages = (1..maxPage).map { page ->
+            val size = if (page in present) {
+                container.pageStore.existing(path, page)?.let { PageStore.imageSize(it) }
+            } else {
+                null
+            }
+            PageMetaPageDto(
+                page = page,
+                widthPt = size?.first?.toDouble() ?: 0.0,
+                heightPt = size?.second?.toDouble() ?: 0.0,
+            )
+        }
+        val synthesized = PageMetaDto(path = path, pageCount = maxPage, pages = pages)
+        runCatching { container.pageStore.saveMeta(path, json.encodeToString(PageMetaDto.serializer(), synthesized)) }
+        return synthesized
+    }
+
+    /** Result of a folder listing, noting whether it came from the cache. */
+    data class BrowseResult(val entries: List<BrowseEntry>, val fromCache: Boolean)
+
+    /**
+     * Folder listing. Successful listings are cached; when the server is
+     * unreachable the last known listing for that folder is returned instead,
+     * so the library screen still works offline.
+     */
+    suspend fun browse(path: String, allowNetwork: Boolean = true): BrowseResult {
+        if (allowNetwork) {
+            val fetched = runCatching { api.browse(path) }
+            fetched.getOrNull()?.let { entries ->
+                container.pageStore.saveListing(path, json.encodeToString(ListSerializer(BrowseEntry.serializer()), entries))
+                return BrowseResult(entries, fromCache = false)
+            }
+            container.pageStore.loadListing(path)?.let { cached ->
+                runCatching {
+                    val entries = json.decodeFromString(ListSerializer(BrowseEntry.serializer()), cached)
+                    return BrowseResult(entries, fromCache = true)
+                }
+            }
+            throw (fetched.exceptionOrNull() as? ApiException)
+                ?: ApiException(ApiErrorKind.UNREACHABLE, "Cannot reach GIGATON")
+        }
+        container.pageStore.loadListing(path)?.let { cached ->
+            runCatching {
+                return BrowseResult(json.decodeFromString(ListSerializer(BrowseEntry.serializer()), cached), fromCache = true)
+            }
+        }
+        throw ApiException(ApiErrorKind.UNREACHABLE, "Offline and this folder was never opened")
+    }
 
     /** True when every page of the paper is cached locally (offline-ready). */
     suspend fun isFullyCached(path: String): Boolean {
-        val meta = runCatching { api.getPageMeta(path) }.getOrNull() ?: return false
+        val meta = runCatching { pageMeta(path) }.getOrNull() ?: return false
         var local = 0
         for (page in 1..meta.pageCount) {
             if (container.pageStore.existing(path, page) != null) local++
@@ -119,7 +204,7 @@ class Repository(private val container: AppContainer) {
         path: String,
         onProgress: (done: Int, total: Int) -> Unit,
     ) {
-        val meta = api.getPageMeta(path)
+        val meta = pageMeta(path)
         val total = meta.pageCount.coerceAtLeast(0)
         var done = 0
         for (page in 1..total) {
@@ -158,7 +243,7 @@ class Repository(private val container: AppContainer) {
      */
     suspend fun autoCachePaper(path: String, fromPage: Int, onProgress: (done: Int, total: Int) -> Unit) {
         if (!settings.autoCacheEnabled) return
-        val meta = runCatching { api.getPageMeta(path) }.getOrNull() ?: return
+        val meta = runCatching { pageMeta(path) }.getOrNull() ?: return
         val total = meta.pageCount
         if (total <= 0) return
         val order = ((fromPage.coerceIn(1, total)..total) + (1 until fromPage.coerceIn(1, total))).toList()

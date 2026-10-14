@@ -26,6 +26,8 @@ class PageStore(
 
     private val pinnedDir = File(rootDir, "downloads").apply { mkdirs() }
     private val cacheDir = File(rootDir, "pagecache").apply { mkdirs() }
+    private val metaDir = File(rootDir, "meta").apply { mkdirs() }
+    private val listingDir = File(rootDir, "listings").apply { mkdirs() }
 
     companion object {
         fun safeKey(serverPath: String): String {
@@ -37,6 +39,17 @@ class PageStore(
         }
 
         fun fileName(serverPath: String, page: Int): String = "${safeKey(serverPath)}_p$page.jpg"
+
+        /** Pixel size of a local page image, reading only the header. */
+        fun imageSize(file: File): Pair<Int, Int>? {
+            val options = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            android.graphics.BitmapFactory.decodeFile(file.absolutePath, options)
+            return if (options.outWidth > 0 && options.outHeight > 0) {
+                options.outWidth to options.outHeight
+            } else {
+                null
+            }
+        }
 
         /**
          * Which cached entries to delete, oldest first, so the cache fits the
@@ -101,6 +114,13 @@ class PageStore(
 
     suspend fun pinnedCount(serverPath: String): Int = dao.pinnedCount(serverPath)
 
+    /** Page numbers that actually exist on disk for a paper, ascending. */
+    suspend fun localPages(serverPath: String): List<Int> =
+        dao.forPaper(serverPath)
+            .filter { fileFor(serverPath, it.page, it.pinned).exists() }
+            .map { it.page }
+            .sorted()
+
     suspend fun pinnedBytes(serverPath: String): Long = dao.pinnedBytesFor(serverPath)
 
     /** Deletes every page of a paper (pinned and cached). */
@@ -123,6 +143,32 @@ class PageStore(
         pinnedBytes = dao.pinnedBytes(),
         budgetBytes = budgetBytes(),
     )
+
+    // ------------------------------------------------------------------ //
+    // Small JSON caches: page metadata and folder listings.
+    //
+    // The reader cannot open a paper without its page count/dimensions, and
+    // the library screen needs the last listing, so both are cached so the app
+    // works with no network at all.
+    // ------------------------------------------------------------------ //
+
+    fun saveMeta(serverPath: String, json: String) {
+        runCatching { File(metaDir, "${safeKey(serverPath)}.json").writeText(json) }
+    }
+
+    fun loadMeta(serverPath: String): String? {
+        val file = File(metaDir, "${safeKey(serverPath)}.json")
+        return if (file.exists()) runCatching { file.readText() }.getOrNull() else null
+    }
+
+    fun saveListing(folderPath: String, json: String) {
+        runCatching { File(listingDir, "${safeKey(folderPath)}.json").writeText(json) }
+    }
+
+    fun loadListing(folderPath: String): String? {
+        val file = File(listingDir, "${safeKey(folderPath)}.json")
+        return if (file.exists()) runCatching { file.readText() }.getOrNull() else null
+    }
 
     private suspend fun enforceBudget() {
         val budget = budgetBytes()

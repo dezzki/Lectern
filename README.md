@@ -175,6 +175,11 @@ When the device is offline the reader serves cached pages and shows "Offline —
 only". A page that was never cached shows "Not cached — connect to load this page" rather
 than failing silently.
 
+A paper's page count and page sizes are cached alongside its pages, and rebuilt from the
+page images on disk if that metadata is missing, so a downloaded paper opens with no
+network at all. Folder listings are cached too, so the library screen still works offline
+and marks itself as showing a cached listing.
+
 Annotations and progress you make while offline are queued in a local database and pushed
 to the server on the next successful request. The browse screen shows how many changes are
 waiting and the last sync error, if any.

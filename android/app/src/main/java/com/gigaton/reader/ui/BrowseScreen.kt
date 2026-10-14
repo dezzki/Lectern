@@ -68,7 +68,10 @@ fun BrowseScreen(
     var entries by remember { mutableStateOf<List<BrowseEntry>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
+    var offlineListing by remember { mutableStateOf(false) }
     var refreshTick by remember { mutableStateOf(0) }
+
+    val online by container.networkMonitor.online.collectAsState()
 
     val downloads by repository.downloads().collectAsState(initial = emptyList())
     val pending by repository.pendingCount().collectAsState(initial = 0)
@@ -78,8 +81,12 @@ fun BrowseScreen(
     suspend fun load() {
         loading = true
         error = null
-        runCatching { repository.browse(currentPath) }
-            .onSuccess { entries = it; loading = false }
+        runCatching { repository.browse(currentPath, allowNetwork = online) }
+            .onSuccess { result ->
+                entries = result.entries
+                offlineListing = result.fromCache
+                loading = false
+            }
             .onFailure {
                 resetApiOnUnauthorized(it, container, onReconnect)
                 error = friendlyBrowseError(it)
@@ -87,7 +94,7 @@ fun BrowseScreen(
             }
     }
 
-    androidx.compose.runtime.LaunchedEffect(currentPath, refreshTick) { load() }
+    androidx.compose.runtime.LaunchedEffect(currentPath, refreshTick, online) { load() }
 
     Scaffold(
         topBar = {
@@ -129,6 +136,18 @@ fun BrowseScreen(
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
             if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
+            if (offlineListing) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "Offline — showing the last known listing",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
             if (syncError != null || pending > 0) {
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),

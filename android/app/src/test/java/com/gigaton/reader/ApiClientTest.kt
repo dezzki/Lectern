@@ -2,12 +2,16 @@ package com.gigaton.reader
 
 import com.gigaton.reader.data.local.PageStore
 import com.gigaton.reader.data.network.AnnotationPut
+import com.gigaton.reader.data.network.PageMetaDto
+import com.gigaton.reader.data.network.PageMetaPageDto
+import com.gigaton.reader.domain.BrowseEntry
+import com.gigaton.reader.domain.EntryType
+import kotlinx.serialization.builtins.ListSerializer
 import com.gigaton.reader.data.network.ApiClient
 import com.gigaton.reader.data.network.ProgressPut
 import com.gigaton.reader.data.repository.Payloads
 import com.gigaton.reader.domain.ApiException
 import com.gigaton.reader.domain.ApiErrorKind
-import com.gigaton.reader.domain.EntryType
 import com.gigaton.reader.ui.pdf.InkStrokeNorm
 import com.gigaton.reader.ui.pdf.OffsetNorm
 import com.gigaton.reader.ui.pdf.QuadNorm
@@ -165,6 +169,34 @@ class ApiClientTest {
         // No path separators survive the hash.
         assertTrue(!a.contains('/') && !a.contains('\\'))
         assertEquals("${a}_p7.jpg", PageStore.fileName("Harness_papers/../evil.pdf", 7))
+    }
+
+    @Test
+    fun offlineCachesRoundTrip() {
+        // Page metadata cached so a downloaded paper opens with no network.
+        val meta = PageMetaDto(
+            path = "Marvel/x.cbz",
+            pageCount = 2,
+            pages = listOf(
+                PageMetaPageDto(1, 300.0, 400.0),
+                PageMetaPageDto(2, 310.0, 400.0),
+            ),
+        )
+        val metaJson = Json.encodeToString(PageMetaDto.serializer(), meta)
+        val metaBack = Json.decodeFromString(PageMetaDto.serializer(), metaJson)
+        assertEquals(2, metaBack.pageCount)
+        assertEquals(300.0, metaBack.pages[0].widthPt, 0.001)
+
+        // Folder listing cached so the library screen works offline.
+        val entries = listOf(
+            BrowseEntry("x.cbz", "Marvel/x.cbz", EntryType.COMIC, 123, null),
+            BrowseEntry("Marvel", "Marvel", EntryType.FOLDER, 0, null),
+        )
+        val listJson = Json.encodeToString(ListSerializer(BrowseEntry.serializer()), entries)
+        val listBack = Json.decodeFromString(ListSerializer(BrowseEntry.serializer()), listJson)
+        assertEquals(2, listBack.size)
+        assertEquals(EntryType.COMIC, listBack[0].type)
+        assertEquals(EntryType.FOLDER, listBack[1].type)
     }
 
     @Test
