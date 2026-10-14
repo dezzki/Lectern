@@ -57,6 +57,21 @@ data class DownloadEntity(
     @ColumnInfo(name = "downloaded_at") val downloadedAt: String,
 )
 
+/**
+ * One page image on disk. Pinned rows are explicit downloads and are never
+ * evicted; unpinned rows are the reading cache and are removed oldest-first
+ * when the cache budget is exceeded.
+ */
+@Entity(tableName = "page_files", primaryKeys = ["paper_path", "page"])
+data class PageFileEntity(
+    @ColumnInfo(name = "paper_path") val paperPath: String,
+    val page: Int,
+    @ColumnInfo(name = "file_name") val fileName: String,
+    val size: Long,
+    val pinned: Boolean,
+    @ColumnInfo(name = "last_access") val lastAccess: Long,
+)
+
 // --------------------------------------------------------------------------- //
 // DAOs
 // --------------------------------------------------------------------------- //
@@ -130,6 +145,51 @@ interface DownloadDao {
     suspend fun delete(path: String)
 }
 
+@Dao
+interface PageFileDao {
+    @Query("SELECT * FROM page_files WHERE paper_path = :path AND page = :page")
+    suspend fun get(path: String, page: Int): PageFileEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(entity: PageFileEntity)
+
+    @Query("UPDATE page_files SET last_access = :ts WHERE paper_path = :path AND page = :page")
+    suspend fun touch(path: String, page: Int, ts: Long)
+
+    @Query("DELETE FROM page_files WHERE paper_path = :path AND page = :page")
+    suspend fun delete(path: String, page: Int)
+
+    @Query("DELETE FROM page_files WHERE paper_path = :path")
+    suspend fun deletePaper(path: String)
+
+    @Query("SELECT * FROM page_files WHERE paper_path = :path")
+    suspend fun forPaper(path: String): List<PageFileEntity>
+
+    @Query("SELECT * FROM page_files WHERE pinned = 0 ORDER BY last_access ASC")
+    suspend fun cachedByAge(): List<PageFileEntity>
+
+    @Query("SELECT COALESCE(SUM(size), 0) FROM page_files WHERE pinned = 0")
+    suspend fun cachedBytes(): Long
+
+    @Query("SELECT COALESCE(SUM(size), 0) FROM page_files WHERE pinned = 1")
+    suspend fun pinnedBytes(): Long
+
+    @Query("SELECT COALESCE(SUM(size), 0) FROM page_files")
+    fun totalBytes(): Flow<Long>
+
+    @Query("SELECT COUNT(*) FROM page_files WHERE paper_path = :path AND pinned = 1")
+    suspend fun pinnedCount(path: String): Int
+
+    @Query("SELECT COALESCE(SUM(size), 0) FROM page_files WHERE paper_path = :path AND pinned = 1")
+    suspend fun pinnedBytesFor(path: String): Long
+
+    @Query("SELECT COUNT(*) FROM page_files WHERE paper_path = :path AND pinned = 0")
+    suspend fun cachedCount(path: String): Int
+
+    @Query("DELETE FROM page_files WHERE pinned = 0")
+    suspend fun clearCache()
+}
+
 // --------------------------------------------------------------------------- //
 // Database
 // --------------------------------------------------------------------------- //
@@ -140,8 +200,9 @@ interface DownloadDao {
         LocalProgressEntity::class,
         OutboxEntity::class,
         DownloadEntity::class,
+        PageFileEntity::class,
     ],
-    version = 1,
+    version = 2,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -149,4 +210,26 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun progressDao(): ProgressDao
     abstract fun outboxDao(): OutboxDao
     abstract fun downloadDao(): DownloadDao
+    abstract fun pageFileDao(): PageFileDao
+
+    companion object {
+        /** Adds the page_files table (v1 -> v2) without dropping existing data. */
+        val MIGRATION_1_2 = object : androidx.room.migration.Migration(1, 2) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `page_files` (
+                      `paper_path` TEXT NOT NULL,
+                      `page` INTEGER NOT NULL,
+                      `file_name` TEXT NOT NULL,
+                      `size` INTEGER NOT NULL,
+                      `pinned` INTEGER NOT NULL,
+                      `last_access` INTEGER NOT NULL,
+                      PRIMARY KEY(`paper_path`, `page`)
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+    }
 }

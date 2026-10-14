@@ -12,8 +12,10 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.gigaton.reader.ui.BrowseScreen
 import com.gigaton.reader.ui.ConnectScreen
+import com.gigaton.reader.ui.DownloadsScreen
 import com.gigaton.reader.ui.ReaderScreen
 import com.gigaton.reader.ui.AnnotationListScreen
+import com.gigaton.reader.ui.SettingsScreen
 import com.gigaton.reader.ui.theme.GigatonTheme
 
 class MainActivity : ComponentActivity() {
@@ -55,13 +57,32 @@ private fun AppNavHost(container: AppContainer) {
                     navController.navigate(Routes.annotations(path, name))
                 },
                 onSettings = {
-                    navController.navigate(Routes.CONNECT) { launchSingleTop = true }
+                    navController.navigate(Routes.SETTINGS) { launchSingleTop = true }
+                },
+                onDownloads = {
+                    navController.navigate(Routes.DOWNLOADS) { launchSingleTop = true }
                 },
                 onReconnect = {
                     navController.navigate(Routes.CONNECT) {
                         popUpTo(Routes.BROWSE) { inclusive = true }
                     }
                 },
+            )
+        }
+        composable(Routes.SETTINGS) {
+            SettingsScreen(
+                container = container,
+                onEditConnection = {
+                    navController.navigate(Routes.CONNECT) { launchSingleTop = true }
+                },
+                onBack = { navController.popBackStack() },
+            )
+        }
+        composable(Routes.DOWNLOADS) {
+            DownloadsScreen(
+                container = container,
+                onOpen = { path, name -> navController.navigate(Routes.reader(path, name)) },
+                onBack = { navController.popBackStack() },
             )
         }
         composable(
@@ -97,6 +118,8 @@ private fun AppNavHost(container: AppContainer) {
 object Routes {
     const val CONNECT = "connect"
     const val BROWSE = "browse"
+    const val SETTINGS = "settings"
+    const val DOWNLOADS = "downloads"
     const val READER = "reader/{target}"
     const val ANNOTATIONS = "annotations/{target}"
 

@@ -56,6 +56,7 @@ fun BrowseScreen(
     onOpenPdf: (path: String, name: String) -> Unit,
     onOpenAnnotations: (path: String, name: String) -> Unit,
     onSettings: () -> Unit,
+    onDownloads: () -> Unit,
     onReconnect: () -> Unit,
 ) {
     val repository = remember { Repository(container) }
@@ -115,6 +116,9 @@ fun BrowseScreen(
                 actions = {
                     IconButton(onClick = { refreshTick++ }) {
                         Icon(Icons.Filled.Refresh, "Refresh")
+                    }
+                    IconButton(onClick = onDownloads) {
+                        Icon(Icons.Filled.Download, "Downloads and offline")
                     }
                     IconButton(onClick = onSettings) {
                         Icon(Icons.Filled.Settings, "Settings")

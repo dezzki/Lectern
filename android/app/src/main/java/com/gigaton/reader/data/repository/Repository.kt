@@ -81,28 +81,39 @@ class Repository(private val container: AppContainer) {
 
     fun downloads(): Flow<List<DownloadEntity>> = db.downloadDao().all()
 
-    fun isDownloaded(path: String): Boolean =
-        container.fileStore.isPaperOffline(path, CLIENT_PAGE_WIDTH)
+    suspend fun isDownloaded(path: String): Boolean =
+        container.pageStore.pinnedCount(path) > 0
 
     suspend fun pageMeta(path: String) = api.getPageMeta(path)
 
-    fun pageImageUrl(path: String, page: Int): String =
-        api.pageImageUrl(path, page, CLIENT_PAGE_WIDTH)
-
-    /**
-     * Coil model for a page: the cached local file if the paper was downloaded
-     * for offline, otherwise the server URL. Offline reading therefore works
-     * with zero extra path logic.
-     */
-    fun pageImageModel(path: String, page: Int): Any {
-        val local = container.fileStore.pageImageFile(path, page, CLIENT_PAGE_WIDTH)
-        return if (local.exists() && local.length() > 0) local
-        else api.pageImageUrl(path, page, CLIENT_PAGE_WIDTH)
+    /** True when every page of the paper is cached locally (offline-ready). */
+    suspend fun isFullyCached(path: String): Boolean {
+        val meta = runCatching { api.getPageMeta(path) }.getOrNull() ?: return false
+        var local = 0
+        for (page in 1..meta.pageCount) {
+            if (container.pageStore.existing(path, page) != null) local++
+        }
+        return local >= meta.pageCount
     }
 
     /**
-     * "Downloads" a paper for offline use: caches every server-rendered page
-     * image into app-private storage. Never touches the source PDF.
+     * Resolves a page to a local file. Uses the pinned/cached copy when present;
+     * otherwise fetches from the server and caches it (only when [allowNetwork]).
+     */
+    suspend fun ensurePage(path: String, page: Int, allowNetwork: Boolean): File? {
+        container.pageStore.existing(path, page)?.let { file ->
+            container.pageStore.touch(path, page)
+            return file
+        }
+        if (!allowNetwork) return null
+        val bytes = runCatching { api.fetchPageBytes(path, page, CLIENT_PAGE_WIDTH) }.getOrNull()
+            ?: return null
+        return runCatching { container.pageStore.put(path, page, bytes, pinned = false) }.getOrNull()
+    }
+
+    /**
+     * "Download for offline": pins every page image so it is never evicted and
+     * the paper opens with no network. Verified against the server's page count.
      */
     suspend fun downloadPaperForOffline(
         path: String,
@@ -112,26 +123,74 @@ class Repository(private val container: AppContainer) {
         val total = meta.pageCount.coerceAtLeast(0)
         var done = 0
         for (page in 1..total) {
-            val out = container.fileStore.pageImageFile(path, page, CLIENT_PAGE_WIDTH)
-            if (!out.exists() || out.length() == 0L) {
-                api.fetchPageImage(path, page, CLIENT_PAGE_WIDTH, out)
+            val alreadyPinned = container.pageStore.isPinned(path, page) &&
+                container.pageStore.existing(path, page) != null
+            if (!alreadyPinned) {
+                val bytes = api.fetchPageBytes(path, page, CLIENT_PAGE_WIDTH)
+                container.pageStore.put(path, page, bytes, pinned = true)
             }
             done++
             onProgress(done, total)
         }
-        val dir = container.fileStore.pagesDir(path, CLIENT_PAGE_WIDTH)
-        val size = dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+        val pinned = container.pageStore.pinnedCount(path)
+        if (pinned < total) {
+            throw IllegalStateException("Download incomplete ($pinned of $total pages)")
+        }
         db.downloadDao().upsert(
-            DownloadEntity(path = path, fileName = dir.name, size = size, downloadedAt = nowIso())
+            DownloadEntity(
+                path = path,
+                fileName = path.substringAfterLast('/'),
+                size = container.pageStore.pinnedBytes(path),
+                downloadedAt = nowIso(),
+            )
         )
     }
 
     suspend fun removeDownload(path: String) {
-        container.fileStore.deletePages(path)
+        container.pageStore.removePaper(path)
         db.downloadDao().delete(path)
     }
 
-    suspend fun clearReaderCache() = container.fileStore.clearCache()
+    /**
+     * Background prefetch of every page of a paper so it becomes offline-ready
+     * after being opened. Pages near [fromPage] are fetched first. Cached pages
+     * are evictable, unlike downloads.
+     */
+    suspend fun autoCachePaper(path: String, fromPage: Int, onProgress: (done: Int, total: Int) -> Unit) {
+        if (!settings.autoCacheEnabled) return
+        val meta = runCatching { api.getPageMeta(path) }.getOrNull() ?: return
+        val total = meta.pageCount
+        if (total <= 0) return
+        val order = ((fromPage.coerceIn(1, total)..total) + (1 until fromPage.coerceIn(1, total))).toList()
+        var done = 0
+        for (page in order) {
+            if (container.pageStore.existing(path, page) != null) {
+                done++
+                continue
+            }
+            val bytes = runCatching { api.fetchPageBytes(path, page, CLIENT_PAGE_WIDTH) }.getOrNull()
+                ?: return // offline or server issue: stop quietly
+            runCatching { container.pageStore.put(path, page, bytes, pinned = false) }
+            done++
+            onProgress(done, total)
+        }
+    }
+
+    suspend fun cacheStats() = container.pageStore.stats()
+
+    suspend fun clearReaderCache() = container.pageStore.clearCache()
+
+    var cacheBudgetBytes: Long
+        get() = settings.cacheBudgetBytes
+        set(value) {
+            settings.cacheBudgetBytes = value
+        }
+
+    var autoCacheEnabled: Boolean
+        get() = settings.autoCacheEnabled
+        set(value) {
+            settings.autoCacheEnabled = value
+        }
 
     // ------------------------------------------------------------------ //
     // Annotations

@@ -54,6 +54,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -79,6 +80,7 @@ import com.gigaton.reader.ui.pdf.ToolMode
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -125,6 +127,8 @@ fun ReaderScreen(
     val annotations by repository.annotationsFlow(paperPath).collectAsState(initial = emptyList())
     LaunchedEffect(paperPath) { repository.refreshAnnotations(paperPath) }
 
+    val online by container.networkMonitor.online.collectAsState()
+
     // ------------------------------------------------------------------ //
     // zoom
     // ------------------------------------------------------------------ //
@@ -160,6 +164,13 @@ fun ReaderScreen(
                 runCatching { repository.saveProgress(paperPath, currentPage) }
             }
         }
+    }
+
+    // Cache the whole paper in the background so it becomes readable offline.
+    LaunchedEffect(meta) {
+        val count = meta?.pageCount ?: return@LaunchedEffect
+        if (count <= 0) return@LaunchedEffect
+        runCatching { repository.autoCachePaper(paperPath, currentPage) { _, _ -> } }
     }
 
     // Jump requests from the annotation list screen.
@@ -239,6 +250,13 @@ fun ReaderScreen(
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
+                        if (!online) {
+                            Text(
+                                "Offline — cached pages only",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
                     }
                 },
                 navigationIcon = {
@@ -333,8 +351,20 @@ fun ReaderScreen(
                             items(count, key = { it }) { index ->
                                 val pageInfo = meta?.pages?.getOrNull(index)
                                 val ratio = pageInfo?.let { (it.widthPt / it.heightPt).toFloat() } ?: 1f
+                                val pageNumber = index + 1
+                                // Resolve to a local file: pinned/cached copy, or fetch
+                                // and cache when online. Keeps working offline.
+                                val model by produceState<File?>(initialValue = null, pageNumber, online) {
+                                    value = repository.ensurePage(paperPath, pageNumber, allowNetwork = online)
+                                }
+                                val placeholder = if (!online && model == null) {
+                                    "Not cached — connect to load this page"
+                                } else {
+                                    null
+                                }
                                 AnnotatedPage(
-                                    model = repository.pageImageModel(paperPath, index + 1),
+                                    model = model,
+                                    placeholder = placeholder,
                                     pageIndex = index,
                                     ratio = ratio,
                                     annotations = annotations.filter { it.page == index + 1 },

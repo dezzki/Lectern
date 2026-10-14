@@ -5,8 +5,9 @@ import android.content.Context
 import androidx.room.Room
 import coil.ImageLoader
 import coil.Coil
+import com.gigaton.reader.data.NetworkMonitor
 import com.gigaton.reader.data.local.AppDatabase
-import com.gigaton.reader.data.local.FileStore
+import com.gigaton.reader.data.local.PageStore
 import com.gigaton.reader.data.local.SettingsStore
 import com.gigaton.reader.data.network.ApiClient
 import com.gigaton.reader.data.repository.Repository
@@ -84,9 +85,17 @@ class AppContainer(context: Context) {
 
     val database: AppDatabase = Room.databaseBuilder(
         appContext, AppDatabase::class.java, "gigaton_reader.db"
-    ).fallbackToDestructiveMigration().build()
+    ).addMigrations(AppDatabase.MIGRATION_1_2)
+        .fallbackToDestructiveMigration()
+        .build()
 
-    val fileStore = FileStore(appContext)
+    val pageStore: PageStore = PageStore(
+        rootDir = appContext.filesDir,
+        dao = database.pageFileDao(),
+        budgetBytes = { settings.cacheBudgetBytes },
+    )
+
+    val networkMonitor: NetworkMonitor = NetworkMonitor(appContext)
 
     @Volatile private var cachedBase: String = ""
     @Volatile private var cachedApi: ApiClient? = null

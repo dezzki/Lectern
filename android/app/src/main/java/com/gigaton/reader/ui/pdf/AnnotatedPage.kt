@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -75,7 +76,8 @@ private fun parseHexColor(hex: String?, fallback: Color): Color {
  */
 @Composable
 fun AnnotatedPage(
-    model: Any,
+    model: Any?,
+    placeholder: String?,
     pageIndex: Int,
     ratio: Float,
     annotations: List<AnnotationRec>,
@@ -152,6 +154,34 @@ fun AnnotatedPage(
                     color = Color(0xFF777777),
                     style = androidx.compose.material3.MaterialTheme.typography.labelSmall,
                 )
+            }
+        } else if (model == null) {
+            Box(
+                Modifier.fillMaxSize().background(Color(0xFFF7F7F7)),
+                contentAlignment = Alignment.Center,
+            ) {
+                androidx.compose.foundation.layout.Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    if (placeholder == null) {
+                        androidx.compose.material3.CircularProgressIndicator(
+                            modifier = Modifier.size(28.dp),
+                            strokeWidth = 2.dp,
+                        )
+                        androidx.compose.foundation.layout.Spacer(Modifier.height(10.dp))
+                        Text(
+                            "Loading page…",
+                            color = Color(0xFF888888),
+                            style = androidx.compose.material3.MaterialTheme.typography.labelSmall,
+                        )
+                    } else {
+                        Text(
+                            placeholder,
+                            color = Color(0xFF888888),
+                            style = androidx.compose.material3.MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                }
             }
         } else {
             AsyncImage(

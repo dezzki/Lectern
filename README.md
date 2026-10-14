@@ -157,9 +157,23 @@ The app checks `/api/health` and then lists the root folder to confirm the token
 
 ## Offline reading
 
-Tapping the download icon next to a PDF caches every page image for that paper. After
-that, the paper opens without a network. Tapping the icon again removes the cached pages.
-Nothing on the server changes.
+There are two levels of offline support.
+
+**Reading cache (automatic).** Opening a paper caches its pages as you read and fetches the
+rest in the background, so a paper you have opened stays readable without a network. These
+pages are stored in the app's private storage and removed oldest-first once the cache limit
+is reached. The default limit is 2 GB; Settings has 500 MB / 1 GB / 2 GB / 4 GB / unlimited,
+a usage readout, and a Clear cache button. Auto-caching can be switched off.
+
+**Downloads (explicit).** The download button next to a paper pins all of its pages so they
+are never evicted, and the paper opens offline at any time. The Downloads screen lists what
+is kept, its size, and the total used on the device; a paper can be removed from there.
+Downloads are verified against the server's page count, so an interrupted download is not
+marked complete and resumes on the next attempt.
+
+When the device is offline the reader serves cached pages and shows "Offline — cached pages
+only". A page that was never cached shows "Not cached — connect to load this page" rather
+than failing silently.
 
 Annotations and progress you make while offline are queued in a local database and pushed
 to the server on the next successful request. The browse screen shows how many changes are

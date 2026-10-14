@@ -28,7 +28,25 @@ class SettingsStore(context: Context) {
         private const val FILE_NAME = "gigaton_secure_prefs"
         private const val KEY_BASE_URL = "base_url"
         private const val KEY_TOKEN = "api_token"
+        private const val KEY_CACHE_BUDGET = "cache_budget_bytes"
+        private const val KEY_AUTO_CACHE = "auto_cache_enabled"
+
+        const val DEFAULT_CACHE_BUDGET = 2L * 1024 * 1024 * 1024 // 2 GB
     }
+
+    /** Cache budget in bytes; 0 means unlimited. */
+    var cacheBudgetBytes: Long
+        get() = prefs.getLong(KEY_CACHE_BUDGET, DEFAULT_CACHE_BUDGET)
+        set(value) {
+            prefs.edit().putLong(KEY_CACHE_BUDGET, value).apply()
+        }
+
+    /** Whether opening a paper caches all of its pages in the background. */
+    var autoCacheEnabled: Boolean
+        get() = prefs.getBoolean(KEY_AUTO_CACHE, true)
+        set(value) {
+            prefs.edit().putBoolean(KEY_AUTO_CACHE, value).apply()
+        }
 
     var baseUrl: String
         get() = prefs.getString(KEY_BASE_URL, null)?.trim().orEmpty().trimEnd('/')

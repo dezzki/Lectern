@@ -1,5 +1,6 @@
 package com.gigaton.reader
 
+import com.gigaton.reader.data.local.PageStore
 import com.gigaton.reader.data.network.AnnotationPut
 import com.gigaton.reader.data.network.ApiClient
 import com.gigaton.reader.data.network.ProgressPut
@@ -156,14 +157,35 @@ class ApiClientTest {
 
     @Test
     fun fileNameIsStableAndSafe() {
-        val a = com.gigaton.reader.data.local.FileStore.safeFileName("Harness_papers/../evil.pdf")
-        val b = com.gigaton.reader.data.local.FileStore.safeFileName("Harness_papers/../evil.pdf")
-        val c = com.gigaton.reader.data.local.FileStore.safeFileName("other.pdf")
+        val a = PageStore.safeKey("Harness_papers/../evil.pdf")
+        val b = PageStore.safeKey("Harness_papers/../evil.pdf")
+        val c = PageStore.safeKey("other.pdf")
         assertEquals(a, b)
         assertEquals(false, a == c)
-        assertTrue(a.startsWith("paper-"))
         // No path separators survive the hash.
         assertTrue(!a.contains('/') && !a.contains('\\'))
+        assertEquals("${a}_p7.jpg", PageStore.fileName("Harness_papers/../evil.pdf", 7))
+    }
+
+    @Test
+    fun evictionPlannerRemovesOldestUntilWithinBudget() {
+        val entries = listOf(
+            PageStore.Entry("a.cbz", 1, 100),
+            PageStore.Entry("a.cbz", 2, 100),
+            PageStore.Entry("b.pdf", 1, 100),
+            PageStore.Entry("b.pdf", 2, 100),
+        )
+        // total 400, budget 250 -> must free 150 -> drop the two oldest
+        val victims = PageStore.planEviction(entries, 400, 250)
+        assertEquals(2, victims.size)
+        assertEquals(PageStore.Entry("a.cbz", 1, 100), victims[0])
+        assertEquals(PageStore.Entry("a.cbz", 2, 100), victims[1])
+
+        // within budget -> nothing removed
+        assertTrue(PageStore.planEviction(entries, 400, 400).isEmpty())
+        assertTrue(PageStore.planEviction(entries, 400, 1000).isEmpty())
+        // unlimited budget -> nothing removed
+        assertTrue(PageStore.planEviction(entries, 400, 0).isEmpty())
     }
 
     @Test
